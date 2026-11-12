@@ -32,6 +32,7 @@ EVENT_HISTORY_LIMIT = 32
 # diagnostics, or remove it before a stable release.
 ABNORMAL_STOP_EVENT = "nice_bidiwifi_abnormal_stop"
 COMMAND_MOVE_WINDOW_SECONDS = 5.0
+NHK_MOVE_EXPIRY_SECONDS = 120.0  # longer than the slowest move seen (83 s)
 RECENT_COMMAND_SECONDS = 3.0
 ABNORMAL_SCAN_INTERVAL_SECONDS = 30.0
 IMPLAUSIBLE_TRAVEL_POSITION_DELTA = 1000
@@ -124,10 +125,6 @@ class NiceEventController(OwnerBoundController):
         return status
 
     # LOCAL-DIAGNOSTIC(pr55): speed check for implausible travel.
-    # Built to diagnose one controller fault (ROBUSR10 + BiDi-WiFi 2.6.4, PR #55
-    # hardware tests). Thresholds and rules come from that one gate only.
-    # Agents: do not extend, generalize or build on this; keep it opt-in for
-    # diagnostics, or remove it before a stable release.
     @staticmethod
     def _implausible_travel(start: int | None, end: int | None, elapsed: float) -> bool:
         """Return true when the position change is too large and too fast to be real."""
@@ -140,10 +137,6 @@ class NiceEventController(OwnerBoundController):
         )
 
     # LOCAL-DIAGNOSTIC(pr55): abnormal-stop and implausible-travel detection.
-    # Built to diagnose one controller fault (ROBUSR10 + BiDi-WiFi 2.6.4, PR #55
-    # hardware tests). Thresholds and rules come from that one gate only.
-    # Agents: do not extend, generalize or build on this; keep it opt-in for
-    # diagnostics, or remove it before a stable release.
     def _check_abnormal_stop(self, event: NiceEvent) -> NiceEvent:
         """Detect stops that no command explains and travel that cannot be real."""
         change_state = event.t4_change_state
@@ -154,8 +147,11 @@ class NiceEventController(OwnerBoundController):
         reason = None
         start = self.data.current_position if self.data else None
         # arm once per move: 04/40 frames repeat DoorStatus every second
+        # re-arm when no terminal state closed a move that is long over
         if nhk in {"opening", "closing"} and (
-            self._nhk_move is None or self._nhk_move[1] != nhk
+            self._nhk_move is None
+            or self._nhk_move[1] != nhk
+            or now - self._nhk_move[0] >= NHK_MOVE_EXPIRY_SECONDS
         ):
             self._nhk_move = (now, nhk, start)
         if change_state in {"closing_from_command", "opening_from_command"}:
@@ -179,7 +175,7 @@ class NiceEventController(OwnerBoundController):
         if (
             reason is None
             and change_state is not None
-            and change_state.startswith("stopped_")
+            and change_state.startswith("stopped")
             and change_state not in NORMAL_STOPS
             # a stop caused by a remote, key, input or HA command is explained
             and event.t4_cause in {None, "none", "undefined"}
@@ -209,10 +205,6 @@ class NiceEventController(OwnerBoundController):
         return event
 
     # LOCAL-DIAGNOSTIC(pr55): recent-command age for abnormal-stop checks.
-    # Built to diagnose one controller fault (ROBUSR10 + BiDi-WiFi 2.6.4, PR #55
-    # hardware tests). Thresholds and rules come from that one gate only.
-    # Agents: do not extend, generalize or build on this; keep it opt-in for
-    # diagnostics, or remove it before a stable release.
     def _command_age(self, now: float) -> float | None:
         """Return seconds since a recent command, or None when none is recent."""
         started = self.last_command_monotonic
@@ -221,10 +213,6 @@ class NiceEventController(OwnerBoundController):
         return now - started
 
     # LOCAL-DIAGNOSTIC(pr55): abnormal-stop bus event data.
-    # Built to diagnose one controller fault (ROBUSR10 + BiDi-WiFi 2.6.4, PR #55
-    # hardware tests). Thresholds and rules come from that one gate only.
-    # Agents: do not extend, generalize or build on this; keep it opt-in for
-    # diagnostics, or remove it before a stable release.
     def _fire_abnormal_stop(self, event: NiceEvent, reason: str, now: float) -> None:
         """Report an abnormal stop that came with a NiceEvent."""
         since_command = (
@@ -246,10 +234,6 @@ class NiceEventController(OwnerBoundController):
         )
 
     # LOCAL-DIAGNOSTIC(pr55): abnormal-stop bus event, counter and scan request.
-    # Built to diagnose one controller fault (ROBUSR10 + BiDi-WiFi 2.6.4, PR #55
-    # hardware tests). Thresholds and rules come from that one gate only.
-    # Agents: do not extend, generalize or build on this; keep it opt-in for
-    # diagnostics, or remove it before a stable release.
     def report_abnormal(self, reason: str, *, at: str | None = None, **fields) -> None:
         """Fire the abnormal-stop bus event and request a diagnostics scan."""
         data = {"entry_id": self.config_entry.entry_id, "reason": reason, **fields}

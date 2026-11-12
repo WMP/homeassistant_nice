@@ -1045,6 +1045,19 @@ async def test_write_dmp_register_records_command_metadata(hass: HomeAssistant) 
     assert instance._extended_status_next_refresh_monotonic == 0.0
 
 
+async def test_scan_request_during_a_scan_is_kept(hass: HomeAssistant) -> None:
+    """An abnormal stop sets 0.0 while a scan runs; the scan end must not overwrite it."""
+    instance = _coordinator(hass)
+    # the scan started when due at 5.0; a request set 0.0 while it ran
+    instance._extended_status_next_refresh_monotonic = 0.0
+    instance._cache_extended_status(make_status(), scan_due=5.0)
+    assert instance._extended_status_next_refresh_monotonic == 0.0
+
+    # no request during the scan: schedule the next one
+    instance._cache_extended_status(make_status(), scan_due=0.0)
+    assert instance._extended_status_next_refresh_monotonic > 0.0
+
+
 async def test_write_dmp_register_blocks_while_gate_is_moving(hass: HomeAssistant) -> None:
     """Test BusT4 config writes are blocked during motion."""
     instance = _coordinator(hass)

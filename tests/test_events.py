@@ -891,6 +891,37 @@ async def test_nhk_normal_travel_is_not_implausible(hass, monkeypatch) -> None:
     await coordinator.async_shutdown()
 
 
+async def test_plain_stopped_without_command_is_unexpected(hass, monkeypatch) -> None:
+    """State 1 is "stopped" (no underscore) and must match like stopped_*."""
+    _Clock(monkeypatch)
+    events = async_capture_events(hass, "nice_bidiwifi_abnormal_stop")
+    coordinator = await _abnormal_coordinator(hass)
+    coordinator.event_controller._handle_raw_frame(_t4_event("04 02 01 00"))
+    await hass.async_block_till_done()
+    assert [(e.data["reason"], e.data["change_state"]) for e in events] == [
+        ("unexpected_stop", "stopped")
+    ]
+    await coordinator.async_shutdown()
+
+
+async def test_nhk_move_without_terminal_state_expires(hass, monkeypatch) -> None:
+    """A move cut without open/closed/stopped must not hide the next fake move."""
+    clock = _Clock(monkeypatch)
+    events = async_capture_events(hass, "nice_bidiwifi_abnormal_stop")
+    coordinator = await _abnormal_coordinator(
+        hass, state="open", current_position=5114, closed_position=0, open_position=5114
+    )
+    controller = coordinator.event_controller
+    controller._handle_raw_frame(frame_xml(_nhk_change("closing")))  # no terminal state
+    clock.now += 200.0
+    controller._handle_raw_frame(frame_xml(_nhk_change("closing")))
+    clock.now += 0.96
+    controller._handle_raw_frame(frame_xml(_nhk_change("closed")))
+    await hass.async_block_till_done()
+    assert [e.data["reason"] for e in events] == ["implausible_travel"]
+    await coordinator.async_shutdown()
+
+
 async def test_one_event_when_04_02_and_nhk_both_match(hass, monkeypatch) -> None:
     clock = _Clock(monkeypatch)
     events = async_capture_events(hass, "nice_bidiwifi_abnormal_stop")

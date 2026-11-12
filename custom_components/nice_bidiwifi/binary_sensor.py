@@ -285,8 +285,13 @@ class NiceBidiBinarySensor(NiceCoordinatorEntity, BinarySensorEntity, RestoreEnt
     async def async_added_to_hass(self) -> None:
         """Restore the last value until a live one arrives."""
         await super().async_added_to_hass()
-        if self.entity_description.restore and (
-            last_state := await self.async_get_last_state()
+        capabilities = self.coordinator.capabilities
+        # restore only when NHK events can replace the value on the next move
+        if (
+            self.entity_description.restore
+            and capabilities is not None
+            and capabilities.obstruction
+            and (last_state := await self.async_get_last_state())
         ):
             self._restored_value = {"on": True, "off": False}.get(last_state.state)
 
