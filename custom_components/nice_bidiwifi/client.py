@@ -13,9 +13,14 @@ import time
 from typing import Any
 
 from .errors import (
+    DMP_STATUS_NHK_FALLBACK_ERROR_CODES,
     NiceAuthError as NiceBidiAuthError,
     NiceConnectionError as NiceBidiConnectionError,
     NiceError as NiceBidiError,
+    NiceProtocolError,
+    NiceReadPreemptedError,
+    NiceUnsupportedError,
+    is_unsupported_request_error,
     nice_error_code as nice_bidi_error_code,
 )
 from .models.credentials import NiceCredentials as NiceBidiCredentials
@@ -54,12 +59,15 @@ from .protocol.nhk.codec import (
 from .protocol.nhk.info import device_info_supports_nhk_status, parse_info_xml
 from .protocol.nhk.administration import (
     LOG_EVENTS_PER_SCOPE,
+    MAX_T4_LOG_ROWS,
     build_logs_body,
+    build_t4_logs_body,
     build_reboot_body,
     build_update_clock_body,
     build_update_name_body,
     parse_groups_xml,
     parse_logs_xml,
+    parse_t4_logs_xml,
     validate_interface_name,
 )
 from .protocol.nhk.status import parse_nhk_status_frames as _parse_nhk_status_frames
@@ -88,6 +96,7 @@ from .protocol.t4.dmp import (
     DmpResponse,
     parse_dmp_response,
 )
+from .protocol.t4.history import ControllerHistoryRow
 from .protocol.t4.registers import (
     CONTROLLER_TARGET,
     CORE_STATUS_PROFILE,
@@ -151,6 +160,7 @@ class NiceBidiClient:
         t4_timeout_ms: int = 200,
         transport_factory: TransportFactory = LanTlsTransport.connect,
         route_name: str = "local",
+        should_yield: Callable[[], bool] | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -160,6 +170,7 @@ class NiceBidiClient:
         self.t4_timeout_ms = t4_timeout_ms
         self._transport_factory = transport_factory
         self._route_name = route_name
+        self._should_yield = should_yield
         self._transport: FrameTransport | None = None
         self._dispatcher: ResponseDispatcher | None = None
         self._event_callbacks: list[RawEventCallback] = []
@@ -178,6 +189,21 @@ class NiceBidiClient:
             if self._transport is not None
             else None
         )
+
+    @property
+    def legacy_tls_active(self) -> bool:
+        """Return whether the connected transport uses legacy TLS compatibility."""
+        return bool(
+            self._transport
+            and getattr(self._transport, "legacy_compatibility", False)
+        )
+
+    @property
+    def tls_cipher_security_level(self) -> int | None:
+        """Return the configured OpenSSL cipher security level when known."""
+        if self._transport is None:
+            return None
+        return getattr(self._transport, "cipher_security_level", None)
 
     @_socket.setter
     def _socket(self, connected_socket: SocketLike | None) -> None:
@@ -246,24 +272,41 @@ class NiceBidiClient:
 
     @property
     def reconnect_count(self) -> int:
-        """Return the number of internal reconnect attempts."""
-        with self._lock:
-            return self._reconnect_count
+        """Return the number of internal reconnect attempts.
+
+        Read without the session lock: sensors call this on the event loop
+        while an operation may hold the lock for a full network timeout.
+        """
+        return self._reconnect_count
 
     def close(self) -> None:
         """Close the current session."""
         with self._lock:
             self._close_locked()
 
-    def read_status(self, *, include_extended: bool = False) -> NiceBidiStatus:
-        """Read status and position DMP registers."""
+    def read_status(
+        self,
+        *,
+        include_extended: bool = False,
+        preemptible: bool = False,
+    ) -> NiceBidiStatus:
+        """Read status and position DMP registers.
+
+        A preemptible read stops between registers when a command is waiting
+        for the session, so polling never delays gate movement.
+        """
         return self._run_with_reconnect(
-            lambda: self._read_status_locked(include_extended=include_extended)
+            lambda: self._read_status_locked(
+                include_extended=include_extended,
+                preemptible=preemptible,
+            )
         )
 
-    def read_nhk_status(self) -> NiceBidiStatus:
+    def read_nhk_status(self, *, preemptible: bool = False) -> NiceBidiStatus:
         """Read state from NHK STATUS/CHANGE properties."""
-        return self._run_with_reconnect(self._read_nhk_status_locked)
+        return self._run_with_reconnect(
+            lambda: self._read_nhk_status_locked(preemptible=preemptible)
+        )
 
     def read_info(self) -> NiceBidiDeviceInfo:
         """Read static BiDi-WiFi and control-unit metadata."""
@@ -280,6 +323,17 @@ class NiceBidiClient:
         """Read a bounded interface and automation event log."""
         return self._run_with_reconnect(
             lambda: self._read_logs_locked(event_count)
+        )
+
+    def read_t4_logs(
+        self,
+        max_rows: int = MAX_T4_LOG_ROWS,
+        *,
+        preemptible: bool = False,
+    ) -> tuple[ControllerHistoryRow, ...]:
+        """Read one page of the controller event history (read-only)."""
+        return self._run_with_reconnect(
+            lambda: self._read_t4_logs_locked(max_rows, preemptible=preemptible)
         )
 
     def read_groups(self) -> NiceGroupSnapshot:
@@ -344,7 +398,8 @@ class NiceBidiClient:
         try:
             return self.read_status()
         except NiceBidiConnectionError as err:
-            if nice_bidi_error_code(err) != "14":
+            error_code = nice_bidi_error_code(err)
+            if error_code not in DMP_STATUS_NHK_FALLBACK_ERROR_CODES:
                 raise
             info = self.read_info()
             if device_info_supports_nhk_status(info, self.device_id):
@@ -352,9 +407,12 @@ class NiceBidiClient:
                     return self.read_nhk_status()
                 except NiceBidiError:
                     _LOGGER.debug(
-                        "Nice NHK status validation failed after DMP Code 14",
+                        "Nice NHK status validation failed after DMP Code %s",
+                        error_code,
                         exc_info=True,
                     )
+            if error_code == "5":
+                raise err from None
             return NiceBidiStatus(
                 state=None,
                 position=None,
@@ -372,6 +430,8 @@ class NiceBidiClient:
                     self._ensure_connected_locked()
                     return operation()
                 except (OSError, ssl.SSLError, NiceBidiConnectionError) as exc:
+                    if is_unsupported_request_error(exc):
+                        raise
                     last_error = exc
                     self._close_locked()
                     if attempt == 0:
@@ -395,6 +455,8 @@ class NiceBidiClient:
                 self._close_locked()
                 raise
             except (OSError, ssl.SSLError, NiceBidiConnectionError) as exc:
+                if is_unsupported_request_error(exc):
+                    raise
                 self._close_locked()
                 raise NiceBidiConnectionError(str(exc)) from exc
 
@@ -466,10 +528,13 @@ class NiceBidiClient:
         )
 
     def _ensure_connected_locked(self) -> None:
+        # A failed reader means the peer already closed or reset the session.
+        # Reconnecting before the request is sent is safe even for commands.
         if (
             self._transport is not None
             and self._transport.connected
             and self._session_key is not None
+            and (self._dispatcher is None or self._dispatcher.failure is None)
         ):
             return
         self._close_locked()
@@ -536,6 +601,7 @@ class NiceBidiClient:
         body: str = "",
         *,
         post_response_listen_seconds: float = 0.0,
+        interrupt: Callable[[], bool] | None = None,
     ) -> list[bytes]:
         xml, request_id = self._signed_request_with_id(request_type, body)
         return self._send_frames_locked(
@@ -543,6 +609,7 @@ class NiceBidiClient:
             expected_type=request_type,
             expected_id=request_id,
             post_response_listen_seconds=post_response_listen_seconds,
+            interrupt=interrupt,
         )
 
     def _send_locked(
@@ -563,6 +630,7 @@ class NiceBidiClient:
         expected_id: int | None,
         *,
         post_response_listen_seconds: float = 0.0,
+        interrupt: Callable[[], bool] | None = None,
     ) -> list[bytes]:
         dispatcher = self._dispatcher
         if dispatcher is None:
@@ -581,6 +649,7 @@ class NiceBidiClient:
             expected_id=expected_id,
             timeout=self.timeout,
             post_response_listen_seconds=post_response_listen_seconds,
+            interrupt=interrupt,
         )
         if frames:
             _LOGGER.debug(
@@ -687,13 +756,26 @@ class NiceBidiClient:
                 key = f"{key}@{daddr:02X}.{dendpoint:02X}"
             registers[key] = parsed
 
-    def _read_status_locked(self, *, include_extended: bool = False) -> NiceBidiStatus:
+    def _read_status_locked(
+        self,
+        *,
+        include_extended: bool = False,
+        preemptible: bool = False,
+    ) -> NiceBidiStatus:
         registers: dict[str, DmpResponse] = {}
         profiles = [CORE_STATUS_PROFILE]
         if include_extended:
             profiles.extend((EXTENDED_CONTROLLER_PROFILE, OXI_INFO_PROFILE))
         for profile in profiles:
             for group, parameter in profile.registers:
+                if (
+                    preemptible
+                    and self._should_yield is not None
+                    and self._should_yield()
+                ):
+                    raise NiceReadPreemptedError(
+                        "status read yielded to a pending command"
+                    )
                 self._read_dmp_register_locked(
                     registers,
                     *profile.target.as_tuple(),
@@ -703,11 +785,17 @@ class NiceBidiClient:
                 )
         return status_from_dmp_registers(registers)
 
-    def _read_nhk_status_locked(self) -> NiceBidiStatus:
+    def _read_nhk_status_locked(self, *, preemptible: bool = False) -> NiceBidiStatus:
+        interrupt = self._should_yield if preemptible else None
         frames = self._signed_exchange_frames_locked(
             "STATUS",
             post_response_listen_seconds=NHK_STATUS_POST_RESPONSE_LISTEN_SECONDS,
+            interrupt=interrupt,
         )
+        if interrupt is not None and interrupt():
+            # The window may have closed before DoorStatus arrived; later
+            # frames are applied as events and the command refreshes status.
+            raise NiceReadPreemptedError("status read yielded to a pending command")
         for frame in frames:
             if "<Error>" in _printable(frame):
                 raise NiceBidiConnectionError(_response_error_summary(frame))
@@ -731,6 +819,23 @@ class NiceBidiClient:
         if "<Error>" in _printable(response):
             raise NiceBidiConnectionError(_response_error_summary(response))
         return parse_logs_xml(_xml_payload(response))
+
+    def _read_t4_logs_locked(
+        self, max_rows: int, *, preemptible: bool = False
+    ) -> tuple[ControllerHistoryRow, ...]:
+        if preemptible and self._should_yield is not None and self._should_yield():
+            raise NiceReadPreemptedError("history read yielded to a pending command")
+        response = self._signed_exchange_locked(
+            "T4_LOGS",
+            build_t4_logs_body(self.device_id, max_rows),
+        )
+        # A rejected or malformed reply must not drop a working session.
+        if "<Error>" in _printable(response):
+            raise NiceUnsupportedError(_response_error_summary(response))
+        try:
+            return parse_t4_logs_xml(_xml_payload(response))
+        except NiceProtocolError as err:
+            raise NiceUnsupportedError(str(err)) from err
 
     def _read_groups_locked(self) -> NiceGroupSnapshot:
         response = self._signed_exchange_locked("GROUPS")

@@ -7,12 +7,16 @@ from dataclasses import replace
 from datetime import datetime
 from itertools import count
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers.update_coordinator import UpdateFailed
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_capture_events,
+)
 
 from custom_components.nice_bidiwifi import calibration as calibration_module
 from custom_components.nice_bidiwifi import coordinator as coordinator_module
@@ -25,6 +29,7 @@ from custom_components.nice_bidiwifi.client import (
 )
 from custom_components.nice_bidiwifi.const import DOMAIN
 from custom_components.nice_bidiwifi.coordinator import NiceBidiDataUpdateCoordinator
+from custom_components.nice_bidiwifi.errors import NiceReadPreemptedError
 from tests.conftest import FakeClient, config_entry_data, make_device_info, make_status
 
 
@@ -71,7 +76,7 @@ async def test_update_data_reads_status_and_caches_device_info(
 
     result = await instance._async_update_data()
 
-    assert result is client.read_status_result
+    assert result == replace(client.read_status_result, last_maneuvers_stale=False)
     assert instance.device_info is client.read_info_result
     assert instance.connection_state == coordinator_module.CONNECTION_STATE_CONNECTED
     assert instance.active_connection_route == "local"
@@ -107,7 +112,6 @@ async def test_update_data_reuses_cached_extended_status_between_broad_reads(
         limit_open=None,
         oxi_detected=None,
         oxi_product=None,
-        last_stop_reason=None,
     )
 
     second = await instance._async_update_data()
@@ -131,7 +135,7 @@ async def test_update_data_ignores_device_info_read_errors(
 
     result = await instance._async_update_data()
 
-    assert result is client.read_status_result
+    assert result == replace(client.read_status_result, last_maneuvers_stale=False)
     assert instance.device_info is None
     assert client.info_reads == 1
 
@@ -161,14 +165,16 @@ async def test_update_data_falls_back_to_command_only_when_dmp_status_is_unsuppo
     assert client.info_reads == 1
 
 
+@pytest.mark.parametrize("error_code", ["5", "14"])
 async def test_update_data_uses_nhk_status_when_dmp_status_is_unsupported(
     hass: HomeAssistant,
+    error_code: str,
 ) -> None:
-    """Test CU_WIFI devices can use NHK DoorStatus when DMP status returns Code 14."""
+    """Test NHK DoorStatus is used for known DMP status compatibility errors."""
     instance = _coordinator(hass)
     client = FakeClient()
     client.read_status_error = NiceBidiConnectionError(
-        '<Response type="T4_REQUEST"><Error><Code>14</Code></Error></Response>'
+        f'<Response type="T4_REQUEST"><Error><Code>{error_code}</Code></Error></Response>'
     )
     client.read_info_result = make_device_info(nhk_status=True)
     client.read_nhk_status_result = make_status(
@@ -391,6 +397,23 @@ async def test_update_data_does_not_fallback_to_command_only_for_other_status_er
     assert instance.connection_state == coordinator_module.CONNECTION_STATE_FAILED
 
 
+async def test_update_data_does_not_use_command_only_mode_for_code_5(
+    hass: HomeAssistant,
+) -> None:
+    """Code 5 still fails when INFO does not provide readable NHK status."""
+    instance = _coordinator(hass)
+    client = FakeClient()
+    client.read_status_error = NiceBidiConnectionError(
+        '<Response type="T4_REQUEST"><Error><Code>5</Code></Error></Response>'
+    )
+    instance.client = client
+
+    with pytest.raises(UpdateFailed):
+        await instance._async_update_data()
+
+    assert instance.status_polling_supported is True
+
+
 async def test_update_data_maps_auth_failure(hass: HomeAssistant) -> None:
     """Test auth error handling."""
     instance = _coordinator(hass)
@@ -406,6 +429,61 @@ async def test_update_data_maps_auth_failure(hass: HomeAssistant) -> None:
     assert instance.local_connection_state == "disconnected"
     assert instance.last_error == "denied"
     assert client.closed is True
+
+
+async def test_preempted_poll_keeps_last_status(hass: HomeAssistant) -> None:
+    """A poll that yields to a command must not make entities unavailable."""
+    instance = _coordinator(hass)
+    client = FakeClient()
+    instance.client = client
+    instance.async_set_updated_data(await instance._async_update_data())
+    previous = instance.data
+
+    client.read_status_error = NiceReadPreemptedError("yielded")
+    result = await instance._async_update_data()
+
+    assert result is previous
+    assert client.read_status_preemptible[-1] is True
+    assert instance.connection_state == coordinator_module.CONNECTION_STATE_CONNECTED
+    assert instance.last_error is None
+    assert client.closed is False
+
+
+async def test_preempted_first_poll_is_an_update_failure(hass: HomeAssistant) -> None:
+    instance = _coordinator(hass)
+    client = FakeClient()
+    client.read_status_error = NiceReadPreemptedError("yielded")
+    instance.client = client
+
+    with pytest.raises(UpdateFailed):
+        await instance._async_update_data()
+
+
+async def test_command_returns_before_post_command_refresh_finishes(
+    hass: HomeAssistant,
+) -> None:
+    """The service call completes as soon as the interface acknowledges."""
+    instance = _coordinator(hass)
+    client = FakeClient()
+    instance.client = client
+    release_refresh = asyncio.Event()
+    refresh_started = False
+
+    async def slow_refresh() -> None:
+        nonlocal refresh_started
+        refresh_started = True
+        await release_refresh.wait()
+
+    instance.async_request_refresh = slow_refresh
+
+    await asyncio.wait_for(instance.async_send_action("open"), timeout=1.0)
+
+    assert client.actions == ["open"]
+    assert refresh_started is True
+    release_refresh.set()
+    await hass.async_block_till_done()
+    await instance._async_cancel_position_simulation()
+    await instance._async_cancel_post_command_refresh()
 
 
 async def test_update_data_maps_connection_failure(hass: HomeAssistant) -> None:
@@ -733,7 +811,7 @@ async def test_cancel_post_command_delay_does_not_cancel_started_refresh(
 async def test_position_simulation_uses_calibrated_travel_speed(
     hass: HomeAssistant,
 ) -> None:
-    """Test display animation uses 80% of full-travel calibration speed."""
+    """Test display animation uses measured full-travel calibration speed."""
     instance = _coordinator(hass)
     client = FakeClient()
     instance.client = client
@@ -749,7 +827,7 @@ async def test_position_simulation_uses_calibrated_travel_speed(
     await instance._async_send_action("open", refresh=False)
 
     assert instance.position_simulation_action == "open"
-    assert instance.position_simulation_speed_percent_per_second == 4.0
+    assert instance.position_simulation_speed_percent_per_second == 5.0
 
     await instance._async_cancel_position_simulation()
 
@@ -767,6 +845,31 @@ async def test_position_simulation_falls_back_without_calibration(
 
     assert instance.position_simulation_action == "close"
     assert instance.position_simulation_speed_percent_per_second == 1.0
+
+    await instance._async_cancel_position_simulation()
+
+
+async def test_position_simulation_learns_speed_from_sparse_live_samples(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sparse T4 positions set the interpolation speed instead of causing jumps."""
+    instance = _coordinator(hass)
+    now = [100.0]
+    monkeypatch.setattr(position_module.time, "monotonic", lambda: now[0])
+
+    instance._sync_position_simulation_from_status(
+        make_status(state="opening", position=20.0, current_position=200)
+    )
+    now[0] = 105.0
+    instance._sync_position_simulation_from_status(
+        make_status(state="opening", position=40.0, current_position=400)
+    )
+
+    assert instance.observed_position_speed_percent_per_second == {"open": 4.0}
+    assert instance.position_simulation_speed_percent_per_second == 4.0
+    now[0] = 107.0
+    assert instance._current_simulated_position() == 48.0
 
     await instance._async_cancel_position_simulation()
 
@@ -901,6 +1004,28 @@ async def test_send_dep_action_wraps_connection_errors(hass: HomeAssistant) -> N
     assert instance.connection_state == coordinator_module.CONNECTION_STATE_FAILED
     assert instance.last_error == "offline"
     assert client.closed is True
+
+
+async def test_code_5_disables_only_the_rejected_dep_action(
+    hass: HomeAssistant,
+) -> None:
+    """A rejected DEP action is hidden for the session without disabling peers."""
+    instance = _coordinator(hass)
+    client = FakeClient()
+    client.send_dep_action_error = NiceBidiConnectionError(
+        '<Response><Error><Code>5</Code></Error></Response>'
+    )
+    instance.client = client
+
+    with pytest.raises(HomeAssistantError, match="command failed"):
+        await instance._async_send_dep_action(
+            DEP_ACTION_PARTIAL_OPEN_1,
+            refresh=False,
+        )
+
+    assert instance.rejected_t4_actions == (DEP_ACTION_PARTIAL_OPEN_1,)
+    assert instance.t4_action_supported(DEP_ACTION_PARTIAL_OPEN_1) is False
+    assert instance.t4_action_supported(DEP_ACTION_COURTESY_LIGHT) is True
 
 
 async def test_write_dmp_register_records_command_metadata(hass: HomeAssistant) -> None:
@@ -1234,7 +1359,7 @@ async def test_time_based_calibration_builds_full_travel_profile(
     )
 
     assert profile["mode"] == "time"
-    assert profile["version"] == 6
+    assert profile["version"] == 7
     assert actions == ["open", "close", "open", "close", "open", "close"]
     assert profile["travel_speed"]["open"]["mode"] == "time"
     assert profile["travel_speed"]["open"]["selection_strategy"] == "median_duration"
@@ -1841,6 +1966,34 @@ async def test_load_calibration_builds_report_from_stored_profile(
     assert instance.calibration_updated_at.isoformat() == profile["updated_at"]
 
 
+async def test_load_calibration_keeps_version_seven_time_profile(
+    hass: HomeAssistant,
+) -> None:
+    """A live-source fallback profile remains usable after a restart."""
+    profile = {
+        "version": 7,
+        "mode": "time",
+        "updated_at": "2026-09-28T10:00:00+00:00",
+        "targets": [],
+        "bounds": {"mode": "time", "full_travel_attempts": 3},
+        "travel_speed": {
+            "open": {"mode": "time", "speed_percent_per_second": 2.0},
+            "close": {"mode": "time", "speed_percent_per_second": 2.0},
+        },
+        "samples": {"open": [], "close": []},
+        "events": [],
+    }
+    instance = _coordinator(hass)
+    instance._calibration_store = FakeStore(profile)
+
+    await instance.async_load_calibration()
+
+    assert instance.calibration_state == coordinator_module.CALIBRATION_STATE_CALIBRATED
+    assert instance.calibration_profile is profile
+    assert instance.calibration_last_error is None
+    assert instance._calibration_store.saved is None
+
+
 async def test_load_calibration_records_storage_error(
     hass: HomeAssistant,
 ) -> None:
@@ -2085,3 +2238,407 @@ def test_select_calibration_sample_prefers_stable_window() -> None:
     assert selected["selected_attempt"] == 3
     assert selected["selected_attempts"] == [2, 3]
     assert selected["ignored_invalid_attempts"] == [4]
+
+
+async def test_failed_poll_closes_client_off_the_event_loop(
+    hass: HomeAssistant,
+) -> None:
+    """Closing waits for the session lock, so it must not block the loop."""
+    import threading
+
+    instance = _coordinator(hass)
+    client = FakeClient()
+    client.read_status_error = NiceBidiConnectionError("offline")
+    close_threads: list[threading.Thread] = []
+    client.close = lambda: close_threads.append(threading.current_thread())
+    instance.client = client
+
+    with pytest.raises(UpdateFailed):
+        await instance._async_update_data()
+
+    assert close_threads
+    assert close_threads[0] is not threading.main_thread()
+
+
+async def _stale_flags(instance, totals, **status_values) -> list[bool | None]:
+    flags = []
+    for total in totals:
+        instance.client.read_status_result = make_status(
+            total_maneuver_count=total, **status_values
+        )
+        instance._extended_status_next_refresh_monotonic = 0.0
+        flags.append((await instance._async_update_data()).last_maneuvers_stale)
+    return flags
+
+
+async def test_healthy_all_ok_maneuver_log_is_not_stale(hass: HomeAssistant) -> None:
+    """A healthy gate keeps an ok x8 log while 04/B3 grows (10 -> 11 -> 12)."""
+    instance = _coordinator(hass)
+    instance.client = FakeClient()
+    assert await _stale_flags(instance, (10, 11, 12)) == [False, False, False]
+
+
+async def test_all_ok_maneuver_log_is_stale_after_abnormal_event(hass: HomeAssistant) -> None:
+    instance = _coordinator(hass)
+    instance.client = FakeClient()
+    assert await _stale_flags(instance, (10,)) == [False]
+    instance.abnormal_stop_count += 1
+    assert await _stale_flags(instance, (11, 12)) == [False, True]
+
+
+async def test_stale_maneuver_log_is_flagged_from_total_count(hass: HomeAssistant) -> None:
+    """A 04/DA log with a failure that stays unchanged while 04/B3 grows is stale."""
+    instance = _coordinator(hass)
+    client = FakeClient()
+    instance.client = client
+    bad = ("ok",) * 7 + ("obstacle_detected",)
+    assert await _stale_flags(instance, (7, 8, 9, 10), last_maneuvers=bad) == [
+        False,
+        False,
+        True,
+        True,
+    ]
+
+    # a changed log starts a new baseline
+    other = ("ok",) * 6 + ("obstacle_detected",) + ("ok",)
+    assert await _stale_flags(instance, (11, 12), last_maneuvers=other) == [False, False]
+
+    # core polls reuse the cached flag
+    client.read_status_result = make_status(
+        last_maneuvers=None, total_maneuver_count=None
+    )
+    assert (await instance._async_update_data()).last_maneuvers_stale is False
+
+
+async def test_startup_obstacle_is_seeded_by_one_nhk_status_read(hass: HomeAssistant) -> None:
+    """A DMP-polled device gets an obstacle value without waiting for an event."""
+    instance = _coordinator(hass)
+    client = FakeClient()
+    client.read_info_result = make_device_info(nhk_status=True)
+    client.read_status_result = make_status(obstacle=None)
+    client.read_nhk_status_result = make_status(obstacle=False)
+    instance.client = client
+
+    first = await instance._async_update_data()
+    assert first.obstacle is False
+    assert first.registers["NHK/Obstruct"] == "false"
+    assert (await instance._async_update_data()).obstacle is False
+    assert client.nhk_status_reads == 1
+
+
+async def _seed_coordinator(hass: HomeAssistant, **client_values):
+    instance = _coordinator(hass)
+    client = FakeClient()
+    client.read_info_result = make_device_info(nhk_status=True)
+    client.read_status_result = make_status(obstacle=None)
+    client.read_nhk_status_result = make_status(obstacle=False)
+    for name, value in client_values.items():
+        setattr(client, name, value)
+    instance.client = client
+    return instance, client
+
+
+async def test_preempted_obstacle_seed_is_retried_on_the_next_poll(
+    hass: HomeAssistant,
+) -> None:
+    instance, client = await _seed_coordinator(
+        hass, read_nhk_status_error=NiceReadPreemptedError("command pending")
+    )
+    assert (await instance._async_update_data()).obstacle is None
+    assert instance.nhk_obstacle_seed == "preempted"
+    client.read_nhk_status_error = None
+    assert (await instance._async_update_data()).obstacle is False
+    assert instance.nhk_obstacle_seed == "seeded_false"
+    assert client.nhk_status_reads == 2
+
+
+async def test_obstacle_seed_outcome_is_recorded(hass: HomeAssistant) -> None:
+    instance, _ = await _seed_coordinator(
+        hass, read_nhk_status_result=make_status(obstacle=None)
+    )
+    await instance._async_update_data()
+    assert instance.nhk_obstacle_seed == "no_value"
+
+    instance, client = await _seed_coordinator(
+        hass, read_nhk_status_error=NiceBidiConnectionError("offline")
+    )
+    await instance._async_update_data()
+    assert instance.nhk_obstacle_seed == "error:NiceBidiConnectionError"
+    await instance._async_update_data()
+    assert client.nhk_status_reads == 1  # errors consume the attempt
+
+    instance, _ = await _seed_coordinator(
+        hass, read_nhk_status_result=make_status(obstacle=True)
+    )
+    await instance._async_update_data()
+    assert instance.nhk_obstacle_seed == "seeded_true"
+
+
+async def test_obstacle_seed_not_advertised(hass: HomeAssistant) -> None:
+    instance, _ = await _seed_coordinator(hass)
+    await instance._async_update_data()
+    instance.capabilities = replace(instance.capabilities, obstruction=False)
+    instance._nhk_obstacle_probed = False
+    instance.nhk_obstacle_seed = None
+    await instance._async_update_data()
+    assert instance.nhk_obstacle_seed == "not_advertised"
+
+
+async def test_controller_limit_drop_raises_and_clears_repair_issue(
+    hass: HomeAssistant,
+) -> None:
+    """A sharp open-position drop is flagged; position is not touched."""
+    from homeassistant.helpers import issue_registry as ir
+
+    instance = _coordinator(hass)
+    client = FakeClient()
+    instance.client = client
+    issue_id = f"controller_limits_changed_{instance.config_entry.entry_id}"
+    registry = ir.async_get(hass)
+
+    async def poll(open_position: int, current: int = 5000):
+        client.read_status_result = make_status(
+            open_position=open_position, current_position=current, position=77.0
+        )
+        return await instance._async_update_data()
+
+    await poll(5263)
+    assert instance.controller_limits_changed is None
+
+    result = await poll(66, current=66)
+    assert result.open_position == 66
+    assert result.position == 77.0  # this code does not rewrite the position
+    assert instance.controller_limits_changed == {
+        "previous_open_position": 5263,
+        "open_position": 66,
+    }
+    issue = registry.async_get_issue(DOMAIN, issue_id)
+    assert issue is not None
+    assert issue.translation_placeholders == {"previous": "5263", "current": "66"}
+
+    await poll(66)  # still flagged, baseline kept
+    assert instance.controller_limits_changed is not None
+
+    await poll(5247)
+    assert instance.controller_limits_changed is None
+    assert registry.async_get_issue(DOMAIN, issue_id) is None
+
+
+async def test_controller_limit_drop_is_one_abnormal_event_with_a_scan(
+    hass: HomeAssistant,
+) -> None:
+    """Cycle 4: 04/18 5114 -> 39 fires one bus event and one scan request."""
+    events = async_capture_events(hass, "nice_bidiwifi_abnormal_stop")
+    instance = _coordinator(hass)
+    client = FakeClient()
+    instance.client = client
+
+    async def poll(open_position: int) -> None:
+        client.read_status_result = make_status(state="open", open_position=open_position)
+        instance.async_set_updated_data(await instance._async_update_data())
+
+    scans = []
+
+    async def fake_refresh() -> None:
+        scans.append(True)
+
+    instance.async_refresh = fake_refresh
+    await poll(5114)
+    assert events == []
+    instance._extended_status_next_refresh_monotonic = 1e9
+    await poll(39)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert [e.data["reason"] for e in events] == ["controller_limits_changed"]
+    assert events[0].data["previous_open_position"] == 5114
+    assert events[0].data["open_position"] == 39
+    assert instance.abnormal_stop_count == 1
+    assert scans == [True]
+    assert instance._extended_status_next_refresh_monotonic == 0.0
+
+    await poll(39)
+    await hass.async_block_till_done()
+    assert len(events) == 1
+    assert instance.abnormal_stop_count == 1
+    await instance.async_shutdown()
+
+
+async def test_small_open_position_change_is_not_flagged(hass: HomeAssistant) -> None:
+    instance = _coordinator(hass)
+    client = FakeClient()
+    instance.client = client
+    for open_position in (5247, 5263):
+        client.read_status_result = make_status(open_position=open_position)
+        await instance._async_update_data()
+    assert instance.controller_limits_changed is None
+
+
+LIMITS_KEY = f"{DOMAIN}.controller_limits.entry-1"
+LIMITS_ISSUE = "controller_limits_changed_entry-1"
+
+
+def _stored_limits(hass_storage, value: int) -> None:
+    hass_storage[LIMITS_KEY] = {
+        "version": 1,
+        "minor_version": 1,
+        "key": LIMITS_KEY,
+        "data": {"open_position": value},
+    }
+
+
+async def _limits_coordinator(hass: HomeAssistant) -> NiceBidiDataUpdateCoordinator:
+    """Build a coordinator the way setup does: baseline loaded before the first poll."""
+    instance = _coordinator(hass)
+    instance.client = FakeClient()
+    instance.async_refresh = AsyncMock()
+    await instance.async_load_limits_baseline()
+    return instance
+
+
+async def _limits_poll(instance, open_position: int) -> None:
+    instance.client.read_status_result = make_status(
+        state="open", open_position=open_position
+    )
+    # the real refresh stores the result; a drop with data present is a live one
+    instance.async_set_updated_data(await instance._async_update_data())
+
+
+def _issue(hass: HomeAssistant):
+    from homeassistant.helpers import issue_registry as ir
+
+    return ir.async_get(hass).async_get_issue(DOMAIN, LIMITS_ISSUE)
+
+
+async def test_restart_with_known_drop_creates_repair_without_a_new_event(
+    hass: HomeAssistant, hass_storage
+) -> None:
+    events = async_capture_events(hass, "nice_bidiwifi_abnormal_stop")
+    _stored_limits(hass_storage, 5114)
+    instance = await _limits_coordinator(hass)
+    await _limits_poll(instance, 39)
+    await hass.async_block_till_done()
+    assert instance.controller_limits_changed == {
+        "previous_open_position": 5114,
+        "open_position": 39,
+    }
+    assert _issue(hass) is not None
+    assert events == []
+    assert instance.abnormal_stop_count == 0
+    await instance.async_shutdown()
+
+
+async def test_drop_during_normal_running_creates_repair_and_one_event(
+    hass: HomeAssistant, hass_storage
+) -> None:
+    events = async_capture_events(hass, "nice_bidiwifi_abnormal_stop")
+    instance = await _limits_coordinator(hass)
+    await _limits_poll(instance, 5114)
+    await _limits_poll(instance, 39)
+    await _limits_poll(instance, 39)
+    await hass.async_block_till_done()
+    assert _issue(hass) is not None
+    assert [e.data["reason"] for e in events] == ["controller_limits_changed"]
+    await instance.async_shutdown()
+
+
+async def test_reload_after_recovery_leaves_no_repair(
+    hass: HomeAssistant, hass_storage
+) -> None:
+    _stored_limits(hass_storage, 5114)
+    instance = await _limits_coordinator(hass)
+    await _limits_poll(instance, 39)
+    assert _issue(hass) is not None
+    await instance.async_shutdown()
+    assert _issue(hass) is None
+
+    instance = await _limits_coordinator(hass)
+    await _limits_poll(instance, 5100)
+    assert _issue(hass) is None
+    assert instance.controller_limits_changed is None
+    await instance.async_shutdown()
+
+
+async def test_baseline_is_saved_only_when_it_changes(
+    hass: HomeAssistant, hass_storage
+) -> None:
+    _stored_limits(hass_storage, 5114)
+    instance = await _limits_coordinator(hass)
+    instance._limits_store.async_save = AsyncMock()
+    await _limits_poll(instance, 5114)  # same as stored: no save
+    await _limits_poll(instance, 5024)
+    await _limits_poll(instance, 5024)
+    await hass.async_block_till_done()
+    instance._limits_store.async_save.assert_awaited_once_with({"open_position": 5024})
+    assert instance._last_open_position == 5024
+    await instance.async_shutdown()
+
+
+async def test_first_value_without_stored_data_is_saved(
+    hass: HomeAssistant, hass_storage
+) -> None:
+    instance = await _limits_coordinator(hass)
+    await _limits_poll(instance, 39)
+    await hass.async_block_till_done()
+    assert instance.controller_limits_changed is None
+    assert hass_storage[LIMITS_KEY]["data"] == {"open_position": 39}
+    await instance.async_shutdown()
+
+
+async def test_fix_flow_accepts_the_new_limits(
+    hass: HomeAssistant, hass_storage
+) -> None:
+    from homeassistant.components.repairs import ConfirmRepairFlow  # noqa: F401
+    from homeassistant.data_entry_flow import FlowResultType
+
+    from custom_components.nice_bidiwifi.repairs import async_create_fix_flow
+
+    _stored_limits(hass_storage, 5114)
+    instance = await _limits_coordinator(hass)
+    instance.config_entry.runtime_data = instance
+    await _limits_poll(instance, 39)
+    assert _issue(hass).is_fixable is True
+
+    flow = await async_create_fix_flow(hass, LIMITS_ISSUE, _issue(hass).data)
+    flow.hass = hass
+    flow.handler = DOMAIN
+    flow.issue_id = LIMITS_ISSUE
+    form = await flow.async_step_confirm(None)
+    assert form["type"] is FlowResultType.FORM
+    # the fix flow text carries the explanation, so it needs the issue placeholders
+    assert form["description_placeholders"] == {"previous": "5114", "current": "39"}
+    result = await flow.async_step_confirm({})
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert instance._last_open_position == 39
+    assert instance.controller_limits_changed is None
+    assert _issue(hass) is None
+    assert hass_storage[LIMITS_KEY]["data"] == {"open_position": 39}
+    await instance.async_shutdown()
+
+
+async def test_fix_flow_aborts_when_the_entry_is_not_loaded(hass: HomeAssistant) -> None:
+    from homeassistant.data_entry_flow import FlowResultType
+
+    from custom_components.nice_bidiwifi.repairs import async_create_fix_flow
+
+    flow = await async_create_fix_flow(hass, LIMITS_ISSUE, {"entry_id": "missing"})
+    flow.hass = hass
+    result = await flow.async_step_confirm({})
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "not_loaded"
+
+
+async def test_remove_entry_deletes_the_issue_and_stored_baseline(
+    hass: HomeAssistant, hass_storage
+) -> None:
+    from custom_components.nice_bidiwifi import async_remove_entry
+
+    _stored_limits(hass_storage, 5114)
+    instance = await _limits_coordinator(hass)
+    await _limits_poll(instance, 39)
+    assert _issue(hass) is not None
+
+    await async_remove_entry(hass, instance.config_entry)
+    assert _issue(hass) is None
+    assert LIMITS_KEY not in hass_storage
+    await instance.async_shutdown()

@@ -49,6 +49,7 @@ async def test_buttons_delegate_to_expected_coordinator_methods() -> None:
     assert ("refresh", None) in coordinator.calls
     assert ("reconnect", None) in coordinator.calls
     assert ("calibrate", None) in coordinator.calls
+    assert ("refresh_controller_history", None) in coordinator.calls
 
 
 def test_button_unique_ids() -> None:
@@ -79,8 +80,8 @@ def test_reconnect_and_refresh_buttons_remain_available_when_coordinator_failed(
     assert buttons["calibrate_positions"].available is False
 
 
-def test_optional_partial_open_buttons_require_known_configuration() -> None:
-    """Test optional partial-open slots are hidden when their registers are absent."""
+def test_partial_open_buttons_follow_advertised_actions_without_position_registers() -> None:
+    """Missing position registers do not hide advertised partial-open actions."""
     coordinator = FakeCoordinator()
     coordinator.data = make_status(
         partial_open_2_position=None,
@@ -93,8 +94,8 @@ def test_optional_partial_open_buttons_require_known_configuration() -> None:
     }
 
     assert buttons["partial_open_1"].available is True
-    assert buttons["partial_open_2"].available is False
-    assert buttons["partial_open_3"].available is False
+    assert buttons["partial_open_2"].available is True
+    assert buttons["partial_open_3"].available is True
 
 
 async def test_t4_buttons_recheck_advertised_support_before_execution() -> None:

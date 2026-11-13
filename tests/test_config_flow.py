@@ -8,6 +8,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import (
     CONF_HOST,
     CONF_NAME,
@@ -37,6 +38,7 @@ from custom_components.nice_bidiwifi.const import (
     CONF_DISCOVERY_MODEL,
     CONF_DISCOVERY_PROTOCOL,
     CONF_DISCOVERY_STATUS_FLAG,
+    CONF_LEGACY_LOCAL_TLS,
     CONF_RELAY_HOST,
     CONF_RELAY_PORT,
     CONF_SOURCE_ID,
@@ -265,6 +267,28 @@ async def test_user_step_auth_error_returns_form(hass: HomeAssistant) -> None:
     assert FakeClient.instances[0].closed is True
 
 
+@pytest.mark.parametrize("error_code", ["7", "15"])
+async def test_user_step_connect_codes_remain_auth_errors(
+    hass: HomeAssistant,
+    error_code: str,
+) -> None:
+    """Runtime recovery codes do not relax initial credential validation."""
+    FakeClient.connect_error = NiceBidiAuthError(
+        f"<Error><Code>{error_code}</Code></Error> (type=CONNECT)"
+    )
+
+    with patch.object(config_flow, "NiceBidiClient", FakeClient):
+        result = await _start_local_flow(hass)
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            _local_input(),
+        )
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"]["base"] == "invalid_auth"
+    assert FakeClient.instances[0].closed is True
+
+
 async def test_user_step_connection_error_returns_form(hass: HomeAssistant) -> None:
     """Test connection failure handling."""
     FakeClient.connect_error = NiceBidiConnectionError("offline")
@@ -371,6 +395,45 @@ async def test_reauth_wrong_device_returns_form(hass: HomeAssistant) -> None:
     assert result["errors"]["base"] == "wrong_device"
 
 
+async def test_reauth_connect_code_remains_auth_error(
+    hass: HomeAssistant,
+) -> None:
+    """Explicit reauthentication remains strict for a CONNECT Code 15."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=config_entry_data(),
+        entry_id="entry-1",
+        unique_id="AA:BB:CC:DD:EE:FF",
+    )
+    entry.add_to_hass(hass)
+    FakeClient.connect_error = NiceBidiAuthError(
+        "<Error><Code>15</Code></Error> (type=CONNECT)"
+    )
+
+    with (
+        patch.object(config_flow, "NiceBidiClient", FakeClient),
+        patch.object(
+            hass.config_entries,
+            "async_reload",
+            new_callable=AsyncMock,
+        ) as reload_entry,
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": "reauth", "entry_id": entry.entry_id},
+            data=entry.data,
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            _input(),
+        )
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"]["base"] == "invalid_auth"
+    assert entry.data == config_entry_data()
+    reload_entry.assert_not_awaited()
+
+
 async def test_reconfigure_success_updates_entry_and_reloads(hass: HomeAssistant) -> None:
     """Test a successful reconfiguration flow."""
     entry = MockConfigEntry(
@@ -420,6 +483,185 @@ async def test_reconfigure_connection_error_returns_form(hass: HomeAssistant) ->
 
     assert result["type"] == FlowResultType.FORM
     assert result["errors"]["base"] == "cannot_connect"
+
+
+async def test_loaded_reconfigure_releases_session_before_validation(
+    hass: HomeAssistant,
+) -> None:
+    """A loaded entry releases its sole NHK session before route validation."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=config_entry_data(),
+        entry_id="entry-1",
+        title="Old gate",
+        unique_id="AA:BB:CC:DD:EE:FF",
+    )
+    entry.add_to_hass(hass)
+    entry.mock_state(hass, ConfigEntryState.LOADED)
+    order: list[str] = []
+
+    async def unload(entry_id: str) -> bool:
+        assert entry_id == entry.entry_id
+        order.append("unload")
+        return True
+
+    async def validate(_hass: HomeAssistant, data: dict[str, Any]) -> None:
+        assert order == ["unload"]
+        assert entry.data[CONF_PORT] == 443
+        assert data[CONF_PORT] == 8443
+        order.append("validate")
+
+    async def setup(entry_id: str) -> bool:
+        assert entry_id == entry.entry_id
+        assert entry.data[CONF_PORT] == 8443
+        order.append("setup")
+        return True
+
+    with (
+        patch.object(config_flow, "_async_validate_input", new=validate),
+        patch.object(hass.config_entries, "async_unload", side_effect=unload),
+        patch.object(hass.config_entries, "async_setup", side_effect=setup),
+        patch.object(
+            hass.config_entries,
+            "async_reload",
+            new_callable=AsyncMock,
+        ) as reload_entry,
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": "reconfigure", "entry_id": entry.entry_id},
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            _input(**{CONF_PORT: 8443}),
+        )
+
+    assert result["type"] == FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert order == ["unload", "validate", "setup"]
+    assert entry.data[CONF_PORT] == 8443
+    assert entry.unique_id == "AA:BB:CC:DD:EE:FF"
+    reload_entry.assert_not_called()
+
+
+async def test_loaded_reconfigure_restores_original_entry_after_failure(
+    hass: HomeAssistant,
+) -> None:
+    """A failed candidate validation sets the original entry up again."""
+    original_data = config_entry_data()
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=original_data,
+        entry_id="entry-1",
+        title="Old gate",
+        unique_id="AA:BB:CC:DD:EE:FF",
+    )
+    entry.add_to_hass(hass)
+    entry.mock_state(hass, ConfigEntryState.LOADED)
+    order: list[str] = []
+
+    async def unload(_entry_id: str) -> bool:
+        order.append("unload")
+        return True
+
+    async def validate(_hass: HomeAssistant, _data: dict[str, Any]) -> None:
+        order.append("validate")
+        raise NiceBidiConnectionError("socket closed by peer")
+
+    async def setup(_entry_id: str) -> bool:
+        assert entry.data == original_data
+        assert entry.title == "Old gate"
+        order.append("setup")
+        return True
+
+    with (
+        patch.object(config_flow, "_async_validate_input", new=validate),
+        patch.object(hass.config_entries, "async_unload", side_effect=unload),
+        patch.object(hass.config_entries, "async_setup", side_effect=setup),
+        patch.object(
+            hass.config_entries,
+            "async_reload",
+            new_callable=AsyncMock,
+        ) as reload_entry,
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": "reconfigure", "entry_id": entry.entry_id},
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            _input(**{CONF_PORT: 8443}),
+        )
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"]["base"] == "cannot_connect"
+    assert order == ["unload", "validate", "setup"]
+    assert entry.data == original_data
+    assert entry.title == "Old gate"
+    reload_entry.assert_not_called()
+
+
+async def test_loaded_reconfigure_stops_when_session_cannot_be_released(
+    hass: HomeAssistant,
+) -> None:
+    """Validation never competes with a session that failed to unload."""
+    original_data = config_entry_data()
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=original_data,
+        entry_id="entry-1",
+        title="Old gate",
+        unique_id="AA:BB:CC:DD:EE:FF",
+    )
+    entry.add_to_hass(hass)
+    entry.mock_state(hass, ConfigEntryState.LOADED)
+
+    async def fail_unload(_entry_id: str) -> bool:
+        entry.mock_state(hass, ConfigEntryState.FAILED_UNLOAD)
+        return False
+
+    with (
+        patch.object(
+            config_flow,
+            "_async_validate_input",
+            new_callable=AsyncMock,
+        ) as validate,
+        patch.object(
+            hass.config_entries,
+            "async_unload",
+            side_effect=fail_unload,
+        ) as unload,
+        patch.object(
+            hass.config_entries,
+            "async_setup",
+            new_callable=AsyncMock,
+        ) as setup,
+        patch.object(
+            hass.config_entries,
+            "async_reload",
+            new_callable=AsyncMock,
+        ) as reload_entry,
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": "reconfigure", "entry_id": entry.entry_id},
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            _input(**{CONF_PORT: 8443}),
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            _input(**{CONF_PORT: 8443}),
+        )
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"]["base"] == "cannot_connect"
+    assert entry.data == original_data
+    unload.assert_awaited_once_with(entry.entry_id)
+    validate.assert_not_awaited()
+    setup.assert_not_awaited()
+    reload_entry.assert_not_awaited()
 
 
 def test_schema_uses_home_assistant_selectors() -> None:
@@ -840,10 +1082,17 @@ async def test_cloud_bootstrap_omits_already_configured_accessories(
     )
     entry.add_to_hass(hass)
     result = await _start_cloud_flow(hass)
-    with patch.object(
-        config_flow,
-        "_async_fetch_cloud_accessories",
-        return_value=_cloud_result(),
+    with (
+        patch.object(
+            config_flow,
+            "_async_fetch_cloud_accessories",
+            return_value=_cloud_result(),
+        ),
+        patch.object(config_flow, "NiceBidiClient", FakeClient),
+        patch(
+            "custom_components.nice_bidiwifi.async_setup_entry",
+            return_value=True,
+        ),
     ):
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"],
@@ -861,6 +1110,150 @@ async def test_cloud_bootstrap_omits_already_configured_accessories(
     options = schema[config_flow.CONF_CLOUD_ACCESSORIES].config["options"]
     assert result["step_id"] == "cloud_accessories"
     assert options == [{"value": "0", "label": "Garage"}]
+
+
+async def test_cloud_bootstrap_does_not_count_ignored_discovery_as_configured(
+    hass: HomeAssistant,
+) -> None:
+    """An ignored discovery record can still be selected during manual import."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        source="ignore",
+        data={},
+        entry_id="ignored-entry",
+        unique_id="AA:BB:CC:DD:EE:FF",
+    )
+    entry.add_to_hass(hass)
+    result = await _start_cloud_flow(hass)
+    with (
+        patch.object(
+            config_flow,
+            "_async_fetch_cloud_accessories",
+            return_value=_cloud_result(),
+        ),
+        patch.object(config_flow, "NiceBidiClient", FakeClient),
+        patch(
+            "custom_components.nice_bidiwifi.async_setup_entry",
+            return_value=True,
+        ),
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                config_flow.CONF_CLOUD_ACCOUNT: "account",
+                config_flow.CONF_CLOUD_ACCOUNT_PASSWORD: "password",
+                config_flow.CONF_CLOUD_CONFIRM: True,
+            },
+        )
+
+        schema = {
+            key.schema: value
+            for key, value in result["data_schema"].schema.items()
+        }
+        options = schema[config_flow.CONF_CLOUD_ACCESSORIES].config["options"]
+        assert result["step_id"] == "cloud_accessories"
+        assert options == [
+            {"value": "0", "label": "Driveway"},
+            {"value": "1", "label": "Garage"},
+        ]
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {config_flow.CONF_CLOUD_ACCESSORIES: ["0"]},
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                CONF_NAME: "Driveway",
+                CONF_HOST: "192.0.2.10",
+                CONF_PORT: 443,
+                CONF_DEVICE_ID: 1,
+                CONF_T4_TIMEOUT_MS: 200,
+            },
+        )
+
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    entries = hass.config_entries.async_entries(DOMAIN, include_ignore=True)
+    assert len(entries) == 1
+    assert entries[0].source != "ignore"
+
+
+async def _start_pending_discovery(hass: HomeAssistant) -> None:
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": "zeroconf"},
+        data=_zeroconf_info(),
+    )
+    assert result["type"] == FlowResultType.FORM
+    assert result["step_id"] == "zeroconf_confirm"
+
+
+async def test_cloud_bootstrap_completes_while_discovery_is_pending(
+    hass: HomeAssistant,
+) -> None:
+    """An unanswered discovery card must not block the MyNice import."""
+    with (
+        patch.object(
+            config_flow,
+            "_async_fetch_cloud_accessories",
+            return_value=_cloud_result(),
+        ),
+        patch.object(config_flow, "NiceBidiClient", FakeClient),
+        patch(
+            "custom_components.nice_bidiwifi.async_setup_entry",
+            return_value=True,
+        ),
+    ):
+        await _start_pending_discovery(hass)
+        result = await _start_cloud_flow(hass)
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                config_flow.CONF_CLOUD_ACCOUNT: "account",
+                config_flow.CONF_CLOUD_ACCOUNT_PASSWORD: "password",
+                config_flow.CONF_CLOUD_CONFIRM: True,
+            },
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {config_flow.CONF_CLOUD_ACCESSORIES: ["0"]},
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                CONF_NAME: "Driveway",
+                CONF_HOST: "192.0.2.10",
+                CONF_PORT: 443,
+                CONF_DEVICE_ID: 1,
+                CONF_T4_TIMEOUT_MS: 200,
+            },
+        )
+
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["result"].unique_id == "AA:BB:CC:DD:EE:FF"
+    assert hass.config_entries.flow.async_progress_by_handler(DOMAIN) == []
+
+
+async def test_manual_setup_completes_while_discovery_is_pending(
+    hass: HomeAssistant,
+) -> None:
+    """An unanswered discovery card must not block manual local setup."""
+    with (
+        patch.object(config_flow, "NiceBidiClient", FakeClient),
+        patch(
+            "custom_components.nice_bidiwifi.async_setup_entry",
+            return_value=True,
+        ),
+    ):
+        await _start_pending_discovery(hass)
+        result = await _start_local_flow(hass)
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            _local_input(),
+        )
+
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["result"].unique_id == "AA:BB:CC:DD:EE:FF"
+    assert hass.config_entries.flow.async_progress_by_handler(DOMAIN) == []
 
 
 async def test_manual_setup_separates_normal_and_advanced_fields(
@@ -892,6 +1285,7 @@ async def test_manual_setup_separates_normal_and_advanced_fields(
                 CONF_PORT: 8443,
                 CONF_DEVICE_ID: 2,
                 CONF_T4_TIMEOUT_MS: 350,
+                CONF_LEGACY_LOCAL_TLS: True,
             },
         )
 
@@ -905,11 +1299,17 @@ async def test_manual_setup_separates_normal_and_advanced_fields(
         CONF_PORT,
         CONF_DEVICE_ID,
         CONF_T4_TIMEOUT_MS,
+        CONF_LEGACY_LOCAL_TLS,
     }
     assert result["data"][CONF_SOURCE_ID] == "controller"
     assert result["data"][CONF_PORT] == 8443
     assert result["data"][CONF_DEVICE_ID] == 2
     assert result["data"][CONF_T4_TIMEOUT_MS] == 350
+    assert result["data"][CONF_LEGACY_LOCAL_TLS] is True
+    assert (
+        FakeClient.instances[0].kwargs["transport_factory"]
+        == config_flow.LegacyLanTlsTransport.connect
+    )
 
 
 async def test_zeroconf_discovery_creates_local_entry(
@@ -931,6 +1331,7 @@ async def test_zeroconf_discovery_creates_local_entry(
             context={"source": "zeroconf"},
             data=discovery,
         )
+        assert result["description_placeholders"]["name"] == "Driveway"
         form_fields = {
             key.schema for key in result["data_schema"].schema
         }

@@ -18,6 +18,7 @@ from custom_components.nice_bidiwifi.client import (
     NiceBidiCredentials,
     NiceBidiDeviceInfo,
     NiceBidiStatus,
+    NiceReadPreemptedError,
     _frame,
     _make_context,
     _random_t4_key,
@@ -33,6 +34,9 @@ from custom_components.nice_bidiwifi.client import (
     parse_dmp_response,
     parse_info_xml,
 )
+from custom_components.nice_bidiwifi.protocol.t4.dmp import DmpResponse
+from custom_components.nice_bidiwifi.protocol.t4.status import status_from_dmp_registers
+from tests.conftest import make_device_info, make_status
 
 
 def _dmp_response(group: int, parameter: int, value: bytes) -> bytes:
@@ -236,8 +240,59 @@ def test_read_status_combines_registers_into_status() -> None:
     assert status.limit_closed is True
     assert status.limit_open is True
     assert status.diagnostics_io_byte == 3
-    assert status.obstacle is True
-    assert status.last_stop_reason == "obstacle_by_encoder"
+    assert status.obstacle is None
+
+
+def _dmp_registers(**values: bytes) -> dict:
+    return {
+        f"04/{key[1:]}": DmpResponse("", 0x04, int(key[1:], 16), value=value)
+        for key, value in values.items()
+    }
+
+
+@pytest.mark.parametrize(
+    ("io_byte", "limit_open", "limit_closed"), [(1, True, False), (2, False, True)]
+)
+def test_status_from_dmp_registers_decodes_limits(
+    io_byte, limit_open, limit_closed
+) -> None:
+    """Test 04/D1 byte 2 bit 0 is open and bit 1 is closed."""
+    status = status_from_dmp_registers(_dmp_registers(rD1=bytes([0, 0, io_byte])))
+
+    assert status.limit_open is limit_open
+    assert status.limit_closed is limit_closed
+
+
+@pytest.mark.parametrize(
+    ("d2_bytes", "voltage", "temperature"),
+    [
+        ({8: 0x00, 9: 0x20, 15: 0x33}, 32, 42),
+        ({8: 0x01, 9: 0x00, 15: 0x33}, 256, 42),
+        ({8: 0xFF, 9: 0x01, 14: 0xFF, 15: 0x33}, None, None),
+        ({8: 0x00, 9: 0x20, 14: 0x01, 15: 0x00}, 32, 256 - 9),
+    ],
+)
+def test_status_from_dmp_registers_decodes_diagnostic_parameters(
+    d2_bytes, voltage, temperature
+) -> None:
+    """Test 04/D2 big-endian voltage and 'not available' markers."""
+    data = bytearray(20)
+    for offset, value in d2_bytes.items():
+        data[offset] = value
+    status = status_from_dmp_registers(_dmp_registers(rD2=bytes(data)))
+
+    assert status.service_voltage == voltage
+    assert status.motor_temperature == temperature
+
+
+def test_status_from_dmp_registers_does_not_derive_obstacle_from_d0() -> None:
+    """Test 04/D0 is a device table, not a stop reason."""
+    assert status_from_dmp_registers(_dmp_registers(rD0=b"\x01")).obstacle is None
+
+
+def test_status_from_dmp_registers_ignores_d4_for_maneuver_count() -> None:
+    """Test 04/D4 is inverter diagnostics, not a maneuver counter."""
+    assert status_from_dmp_registers(_dmp_registers(rD4=b"\x00\x05")).total_maneuver_count is None
 
 
 @pytest.mark.parametrize("status_byte", [0x10, 0x11, 0x12])
@@ -423,6 +478,7 @@ def test_read_nhk_status_parses_status_response() -> None:
             body="",
             *,
             post_response_listen_seconds=0.0,
+            interrupt=None,
         ):
             assert request_type == "STATUS"
             return [
@@ -459,6 +515,7 @@ def test_read_nhk_status_accepts_unknown_door_status() -> None:
             body="",
             *,
             post_response_listen_seconds=0.0,
+            interrupt=None,
         ):
             assert request_type == "STATUS"
             return [
@@ -494,6 +551,7 @@ def test_read_nhk_status_accepts_change_event_frame() -> None:
             body="",
             *,
             post_response_listen_seconds=0.0,
+            interrupt=None,
         ):
             return [
                 STX
@@ -523,6 +581,7 @@ def test_read_nhk_status_parses_cuwifi_instant_position_event() -> None:
             body="",
             *,
             post_response_listen_seconds=0.0,
+            interrupt=None,
         ):
             assert request_type == "STATUS"
             assert post_response_listen_seconds > 0
@@ -560,6 +619,7 @@ def test_read_nhk_status_parses_rba4r10_raw_live_position_event() -> None:
             body="",
             *,
             post_response_listen_seconds=0.0,
+            interrupt=None,
         ):
             assert request_type == "STATUS"
             assert post_response_listen_seconds > 0
@@ -596,6 +656,7 @@ def test_read_nhk_status_scales_low_rba4r10_raw_position_as_raw_not_percent() ->
             body="",
             *,
             post_response_listen_seconds=0.0,
+            interrupt=None,
         ):
             return [
                 STX
@@ -629,6 +690,7 @@ def test_read_nhk_status_keeps_moving_state_for_intermediate_cuwifi_stopped_posi
             body="",
             *,
             post_response_listen_seconds=0.0,
+            interrupt=None,
         ):
             return [
                 STX
@@ -665,6 +727,7 @@ def test_read_nhk_status_does_not_invent_state_from_cuwifi_position_event() -> N
             body="",
             *,
             post_response_listen_seconds=0.0,
+            interrupt=None,
         ):
             return [
                 STX
@@ -697,6 +760,7 @@ def test_read_nhk_status_uses_cuwifi_t4_endpoint_state_without_position() -> Non
             body="",
             *,
             post_response_listen_seconds=0.0,
+            interrupt=None,
         ):
             return [
                 STX
@@ -733,6 +797,7 @@ def test_read_nhk_status_ignores_out_of_range_cuwifi_position_event() -> None:
             body="",
             *,
             post_response_listen_seconds=0.0,
+            interrupt=None,
         ):
             return [
                 STX
@@ -924,6 +989,52 @@ def test_test_connection_falls_back_to_info_when_dmp_status_is_unsupported() -> 
     assert client.info_reads == 1
 
 
+def test_test_connection_accepts_code_5_only_with_working_nhk_status() -> None:
+    """Code 5 is compatible only when INFO and NHK status confirm the fallback."""
+
+    class NhkStatusClient(NiceBidiClient):
+        def read_status(self):
+            raise NiceBidiConnectionError(
+                '<Response><Error><Code>5</Code></Error></Response>'
+            )
+
+        def read_info(self):
+            return make_device_info(nhk_status=True)
+
+        def read_nhk_status(self):
+            return make_status(state="closed", position=None)
+
+    client = NhkStatusClient(
+        "192.0.2.10",
+        443,
+        NiceBidiCredentials("user", "AA" * 32, "AA:BB:CC:DD:EE:FF"),
+    )
+
+    assert client.test_connection().state == "closed"
+
+
+def test_test_connection_rejects_code_5_without_nhk_status() -> None:
+    """Code 5 is not treated as command-only or globally harmless."""
+
+    class UnsupportedClient(NiceBidiClient):
+        def read_status(self):
+            raise NiceBidiConnectionError(
+                '<Response><Error><Code>5</Code></Error></Response>'
+            )
+
+        def read_info(self):
+            return make_device_info(nhk_status=False)
+
+    client = UnsupportedClient(
+        "192.0.2.10",
+        443,
+        NiceBidiCredentials("user", "AA" * 32, "AA:BB:CC:DD:EE:FF"),
+    )
+
+    with pytest.raises(NiceBidiConnectionError, match="<Code>5</Code>"):
+        client.test_connection()
+
+
 def test_run_with_reconnect_retries_once(monkeypatch: pytest.MonkeyPatch) -> None:
     """Test reconnect loop behavior."""
     client = _client()
@@ -948,6 +1059,37 @@ def test_run_with_reconnect_retries_once(monkeypatch: pytest.MonkeyPatch) -> Non
     assert client._run_with_reconnect(operation) == "ok"
     assert ensure_calls == 2
     assert client.reconnect_count == 1
+
+
+@pytest.mark.parametrize("runner", ["_run_with_reconnect", "_run_command_once"])
+def test_unsupported_request_keeps_the_session(
+    monkeypatch: pytest.MonkeyPatch,
+    runner: str,
+) -> None:
+    """Code 14 is an answer on a working session, not a reason to reconnect."""
+    client = _client()
+    closes = 0
+    calls = 0
+
+    def close() -> None:
+        nonlocal closes
+        closes += 1
+
+    def operation() -> None:
+        nonlocal calls
+        calls += 1
+        raise NiceBidiConnectionError("<Error><Code>14</Code></Error> (type=T4_REQUEST)")
+
+    monkeypatch.setattr(client, "_ensure_connected_locked", lambda: None)
+    monkeypatch.setattr(client, "_close_locked", close)
+    monkeypatch.setattr("custom_components.nice_bidiwifi.client.time.sleep", lambda seconds: None)
+
+    with pytest.raises(NiceBidiConnectionError, match="<Code>14</Code>"):
+        getattr(client, runner)(operation)
+
+    assert calls == 1
+    assert closes == 0
+    assert client.reconnect_count == 0
 
 
 def test_command_runner_never_replays_ambiguous_write(
@@ -976,6 +1118,158 @@ def test_command_runner_never_replays_ambiguous_write(
 
     assert calls == 1
     assert closes == 1
+
+
+def test_preemptible_status_read_yields_between_registers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A poll stops before its next register once a command is waiting."""
+    requested: list[tuple[int, int]] = []
+    command_waiting = False
+    closes = 0
+
+    class StatusClient(NiceBidiClient):
+        def _t4_request_locked(self, protocol, plain_payload, daddr, dendpoint, tout_ms):
+            nonlocal command_waiting
+            key = (plain_payload[9], plain_payload[10])
+            requested.append(key)
+            command_waiting = True
+            return b"<Response />", [_dmp_response(*key, b"\x02")]
+
+    client = StatusClient(
+        "192.0.2.10",
+        443,
+        NiceBidiCredentials("user", "AA" * 32, "AA:BB:CC:DD:EE:FF"),
+        should_yield=lambda: command_waiting,
+    )
+    monkeypatch.setattr(client, "_ensure_connected_locked", lambda: None)
+
+    def close() -> None:
+        nonlocal closes
+        closes += 1
+
+    monkeypatch.setattr(client, "_close_locked", close)
+
+    with pytest.raises(NiceReadPreemptedError):
+        client.read_status(include_extended=True, preemptible=True)
+
+    assert requested == [(0x04, 0x01)]
+    assert closes == 0
+    assert client.reconnect_count == 0
+
+
+def test_non_preemptible_status_read_ignores_waiting_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Calibration and target watchers keep complete reads."""
+    requested: list[tuple[int, int]] = []
+
+    class StatusClient(NiceBidiClient):
+        def _t4_request_locked(self, protocol, plain_payload, daddr, dendpoint, tout_ms):
+            key = (plain_payload[9], plain_payload[10])
+            requested.append(key)
+            return b"<Response />", [_dmp_response(*key, b"\x02")]
+
+    client = StatusClient(
+        "192.0.2.10",
+        443,
+        NiceBidiCredentials("user", "AA" * 32, "AA:BB:CC:DD:EE:FF"),
+        should_yield=lambda: True,
+    )
+    monkeypatch.setattr(client, "_ensure_connected_locked", lambda: None)
+
+    client.read_status()
+
+    assert len(requested) == 4
+
+
+class _Transport:
+    connected = True
+
+    def close(self) -> None:
+        self.connected = False
+
+
+class _Dispatcher:
+    def __init__(self, failure: Exception | None) -> None:
+        self.failure = failure
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_opens"),
+    [(OSError("socket closed by peer"), 1), (None, 0)],
+)
+def test_command_reconnects_only_when_reader_already_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception | None,
+    expected_opens: int,
+) -> None:
+    """A dead session is replaced before the command is sent, never after."""
+    client = _client()
+    client._transport = _Transport()
+    client._dispatcher = _Dispatcher(failure)
+    client._session_key = b"session"
+    opens = 0
+    sent: list[str] = []
+
+    def open_session() -> None:
+        nonlocal opens
+        opens += 1
+
+    monkeypatch.setattr(client, "_open_locked", open_session)
+    monkeypatch.setattr(
+        client,
+        "_connect_locked",
+        lambda: setattr(client, "_session_key", b"new-session"),
+    )
+    monkeypatch.setattr(client, "_send_action_locked", sent.append)
+
+    client.send_action("open")
+
+    assert opens == expected_opens
+    assert sent == ["open"]
+
+
+@pytest.mark.parametrize("preemptible", [True, False])
+def test_nhk_status_read_yields_only_when_preemptible(preemptible: bool) -> None:
+    """Only the background poll gives up its STATUS window to a command."""
+    interrupts: list[object] = []
+
+    class NhkStatusClient(NiceBidiClient):
+        def _signed_exchange_frames_locked(
+            self,
+            request_type,
+            body="",
+            *,
+            post_response_listen_seconds=0.0,
+            interrupt=None,
+        ):
+            interrupts.append(interrupt)
+            return [
+                STX
+                + b'<Response type="STATUS" id="513"><Devices><Device id="1"><Properties>'
+                + b"<DoorStatus>closing</DoorStatus>"
+                + b"</Properties></Device></Devices></Response>"
+                + ETX
+            ]
+
+    client = NhkStatusClient(
+        "192.0.2.10",
+        443,
+        NiceBidiCredentials("user", "AA" * 32, "AA:BB:CC:DD:EE:FF"),
+        should_yield=lambda: True,
+    )
+
+    if preemptible:
+        with pytest.raises(NiceReadPreemptedError):
+            client._read_nhk_status_locked(preemptible=True)
+        assert interrupts[0] is not None and interrupts[0]() is True
+    else:
+        assert client._read_nhk_status_locked().state == "closing"
+        assert interrupts == [None]
 
 
 def test_send_action_rejects_invalid_action() -> None:
@@ -1115,3 +1409,49 @@ def test_status_reports_moving_states() -> None:
     """Test status movement helper."""
     assert NiceBidiStatus("opening", 10, 100, 0, 1000, {}).is_moving
     assert not NiceBidiStatus("open", 100, 1000, 0, 1000, {}).is_moving
+
+
+def test_reconnect_count_does_not_wait_for_the_session_lock() -> None:
+    """Sensors read this on the event loop during long network operations."""
+    import threading
+
+    client = _client()
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold_lock() -> None:
+        with client._lock:
+            held.set()
+            release.wait(timeout=5.0)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    held.wait(timeout=2.0)
+    reader_done = threading.Event()
+    result: list[int] = []
+    reader = threading.Thread(
+        target=lambda: (result.append(client.reconnect_count), reader_done.set())
+    )
+    reader.start()
+    try:
+        assert reader_done.wait(timeout=1.0)
+        assert result == [0]
+    finally:
+        release.set()
+        holder.join(timeout=2.0)
+        reader.join(timeout=2.0)
+
+
+def test_status_from_dmp_registers_decodes_bluebus_devices() -> None:
+    """Test 04/D0 is decoded into installed BlueBus devices."""
+    sample = bytes.fromhex("11008100000000000000007f000000000000000100c00000000000")
+    status = status_from_dmp_registers(_dmp_registers(rD0=sample))
+
+    assert status.bluebus_devices == {"photo": "on"}
+
+
+def test_status_from_dmp_registers_decodes_last_maneuvers() -> None:
+    """Test 04/DA is decoded into 8 maneuver outcomes."""
+    status = status_from_dmp_registers(_dmp_registers(rDA=bytes([0, 3, 0, 0, 0, 0, 0, 0])))
+
+    assert status.last_maneuvers == ("ok", "obstacle_detected") + ("ok",) * 6

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from collections import deque
 from datetime import UTC, datetime
+from pathlib import Path
 
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
 
 from custom_components.nice_bidiwifi.const import (
     CONF_CONNECTION_MODE,
+    CONF_LEGACY_LOCAL_TLS,
     CONF_SOURCE_ID,
     CONF_TARGET_MAC,
 )
@@ -21,6 +23,15 @@ from custom_components.nice_bidiwifi.models.administration import (
     NiceGroupSummary,
     NiceLogEvent,
     NiceLogSnapshot,
+)
+from custom_components.nice_bidiwifi.models.commands import (
+    CommandAcknowledgement,
+    CommandKind,
+    NiceCommand,
+    NiceCommandResult,
+)
+from custom_components.nice_bidiwifi.protocol.nhk.administration import (
+    parse_t4_logs_xml,
 )
 from tests.conftest import FakeCoordinator, config_entry
 
@@ -64,11 +75,23 @@ async def test_diagnostics_redacts_sensitive_data(hass) -> None:
         ),
         maxlen=16,
     )
+    coordinator.controller_event_history = parse_t4_logs_xml(
+        (Path(__file__).parent / "fixtures" / "t4_logs_reply.xml").read_text()
+    )
+    coordinator.controller_event_history_error = "NiceBidiConnectionError: busy"
     entry = config_entry()
     entry.runtime_data = coordinator
 
     diagnostics = await async_get_config_entry_diagnostics(hass, entry)
 
+    stream = diagnostics["event_stream"]
+    assert stream["controller_event_history_error"] == "NiceBidiConnectionError: busy"
+    assert [row["id"] for row in stream["controller_event_history"]] == [1028, 1027, 1013, 655]
+    assert set(stream["controller_event_history"][0]) == {
+        "id", "time", "dep", "change_state", "cause", "data_hex"
+    }
+    assert "7ndZS2whmyxS8wwgxC" not in str(diagnostics)
+    assert "LTECwFJ40pD" not in str(diagnostics)
     assert diagnostics["entry"][CONF_HOST] == "**REDACTED**"
     assert diagnostics["entry"][CONF_USERNAME] == "**REDACTED**"
     assert diagnostics["entry"][CONF_PASSWORD] == "**REDACTED**"
@@ -83,6 +106,12 @@ async def test_diagnostics_redacts_sensitive_data(hass) -> None:
         "certificate_verification": None,
         "hostname_verification": None,
         "compatibility_reason": None,
+    }
+    assert diagnostics["connection"]["local_tls"] == {
+        "configured": True,
+        "legacy_compatibility_enabled": False,
+        "legacy_compatibility_active": False,
+        "cipher_security_level": None,
     }
     assert diagnostics["device_info"]["interface_serial"] == "**REDACTED**"
     assert diagnostics["device_info"]["device_serial"] == "**REDACTED**"
@@ -135,3 +164,38 @@ async def test_diagnostics_reports_unverified_relay_tls(hass) -> None:
         "hostname_verification": False,
         "compatibility_reason": "nice_relay_unverifiable_certificate",
     }
+
+
+async def test_diagnostics_reports_legacy_local_tls_opt_in(hass) -> None:
+    """Diagnostics make the local TLS compatibility choice explicit."""
+    coordinator = FakeCoordinator()
+    coordinator.client.local_tls_legacy_active = True
+    coordinator.client.local_tls_cipher_security_level = 0
+    entry = config_entry(**{CONF_LEGACY_LOCAL_TLS: True})
+    entry.runtime_data = coordinator
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, entry)
+
+    assert diagnostics["entry"][CONF_LEGACY_LOCAL_TLS] is True
+    assert diagnostics["connection"]["local_tls"] == {
+        "configured": True,
+        "legacy_compatibility_enabled": True,
+        "legacy_compatibility_active": True,
+        "cipher_security_level": 0,
+    }
+
+
+async def test_diagnostics_names_command_error_code(hass) -> None:
+    """Numeric NHK error codes get an EvtError/Error.java name."""
+    coordinator = FakeCoordinator()
+    for code, name in (("2", "auth_failed"), ("x", None)):
+        coordinator.last_command_result = NiceCommandResult(
+            command=NiceCommand(key="open", kind=CommandKind.DOOR_ACTION),
+            acknowledgement=CommandAcknowledgement.REJECTED,
+            latency_ms=1,
+            error_code=code,
+        )
+        entry = config_entry()
+        entry.runtime_data = coordinator
+        diagnostics = await async_get_config_entry_diagnostics(hass, entry)
+        assert diagnostics["command"]["error_name"] == name

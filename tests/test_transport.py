@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ssl
 import threading
+import time
 from queue import Empty, Queue
 
 import pytest
@@ -12,7 +13,11 @@ from custom_components.nice_bidiwifi.protocol.nhk.codec import frame_xml
 from custom_components.nice_bidiwifi.transport.dispatcher import (
     ResponseDispatcher,
 )
-from custom_components.nice_bidiwifi.transport.lan import SocketFrameTransport
+from custom_components.nice_bidiwifi.transport.lan import (
+    LegacyLanTlsTransport,
+    SocketFrameTransport,
+    make_local_tls_context,
+)
 from custom_components.nice_bidiwifi.transport.relay import make_relay_tls_context
 
 
@@ -107,6 +112,45 @@ def test_dispatcher_is_the_only_reader_and_routes_unsolicited_frames() -> None:
     assert events == [event]
     assert socket.sent == [frame_xml('<Request type="STATUS" id="7"/>')]
     assert socket.recv_calls >= 1
+
+
+def test_interrupt_ends_post_response_window_and_keeps_late_frames_as_events() -> None:
+    """A waiting command cuts the listening window without losing frames."""
+    socket = QueueSocket()
+    dispatcher = ResponseDispatcher(SocketFrameTransport(socket))
+    events: list[bytes] = []
+    dispatcher.add_event_callback(events.append)
+    response = frame_xml('<Response type="STATUS" id="7"/>')
+    late = frame_xml(
+        '<Response type="CHANGE" id="99"><DoorStatus>open</DoorStatus></Response>'
+    )
+    command_waiting = threading.Event()
+    socket.feed(response)
+
+    def request_command() -> None:
+        time.sleep(0.1)
+        command_waiting.set()
+
+    threading.Thread(target=request_command).start()
+    started = time.monotonic()
+    frames = dispatcher.exchange(
+        frame_xml('<Request type="STATUS" id="7"/>'),
+        expected_type="STATUS",
+        expected_id=7,
+        timeout=1.0,
+        post_response_listen_seconds=5.0,
+        interrupt=command_waiting.is_set,
+    )
+    elapsed = time.monotonic() - started
+    socket.feed(late)
+    deadline = time.monotonic() + 1.0
+    while not events and time.monotonic() < deadline:
+        time.sleep(0.01)
+    dispatcher.close()
+
+    assert frames == [response]
+    assert elapsed < 1.0
+    assert events == [late]
 
 
 def test_transport_close_is_idempotent_and_discards_buffers() -> None:
@@ -232,3 +276,87 @@ def test_relay_tls_context_uses_encryption_without_peer_verification() -> None:
     assert context.verify_mode is ssl.CERT_NONE
     assert context.check_hostname is False
     assert context.minimum_version >= ssl.TLSVersion.TLSv1_2
+
+
+def test_legacy_local_tls_context_is_explicit_and_constrained() -> None:
+    """Legacy options are absent by default and bounded when explicitly enabled."""
+    standard = make_local_tls_context()
+    legacy = make_local_tls_context(
+        legacy_compatibility=True,
+        cipher_security_level=1,
+    )
+
+    assert standard.minimum_version is ssl.TLSVersion.TLSv1_2
+    assert standard.maximum_version is ssl.TLSVersion.TLSv1_2
+    assert legacy.options & ssl.OP_LEGACY_SERVER_CONNECT
+    assert legacy.security_level == 1
+
+
+@pytest.mark.parametrize(
+    "error_message",
+    [
+        "[SSL: DH_KEY_TOO_SMALL] dh key too small",
+        "[SSL: WRONG_SIGNATURE_TYPE] wrong signature type",
+    ],
+)
+def test_legacy_local_tls_relaxes_only_for_approved_security_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    error_message: str,
+) -> None:
+    """Security level 0 is retried only for approved OpenSSL reasons."""
+    attempts: list[int | None] = []
+    connected = object()
+
+    def connect_once(
+        cls,
+        host,
+        port,
+        timeout,
+        context,
+        *,
+        legacy_compatibility=False,
+        cipher_security_level=None,
+    ):
+        attempts.append(cipher_security_level)
+        if cipher_security_level == 1:
+            raise ssl.SSLError(error_message)
+        return connected
+
+    monkeypatch.setattr(
+        LegacyLanTlsTransport,
+        "_connect_with_context",
+        classmethod(connect_once),
+    )
+
+    assert LegacyLanTlsTransport.connect("192.0.2.10", 443, 10.0) is connected
+    assert attempts == [1, 0]
+
+
+def test_legacy_local_tls_does_not_relax_for_other_handshake_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unrelated TLS failures retain security level 1 and propagate."""
+    attempts: list[int | None] = []
+
+    def connect_once(
+        cls,
+        host,
+        port,
+        timeout,
+        context,
+        *,
+        legacy_compatibility=False,
+        cipher_security_level=None,
+    ):
+        attempts.append(cipher_security_level)
+        raise ssl.SSLError("certificate failure")
+
+    monkeypatch.setattr(
+        LegacyLanTlsTransport,
+        "_connect_with_context",
+        classmethod(connect_once),
+    )
+
+    with pytest.raises(ssl.SSLError, match="certificate failure"):
+        LegacyLanTlsTransport.connect("192.0.2.10", 443, 10.0)
+    assert attempts == [1]

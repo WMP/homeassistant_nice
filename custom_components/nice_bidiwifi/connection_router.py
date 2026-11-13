@@ -3,17 +3,29 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import logging
 import threading
 import time
 from typing import Any
 
 from .client import NiceBidiAuthError, NiceBidiClient, NiceBidiConnectionError
 from .connection import NiceConnectionHealth, NiceConnectionRoute, NiceRouteState
+from .errors import (
+    RUNTIME_RETRYABLE_CONNECT_ERROR_CODES,
+    is_unsupported_request_error,
+    nice_error_code,
+)
 from .models.config import ConnectionMode, NiceEntryConfig, NiceEndpoint
-from .protocol.nhk.administration import LOG_EVENTS_PER_SCOPE
+from .protocol.nhk.administration import LOG_EVENTS_PER_SCOPE, MAX_T4_LOG_ROWS
+from .transport.lan import LegacyLanTlsTransport
 from .transport.relay import RelayTlsTransport
 
+_LOGGER = logging.getLogger(__name__)
+
 LOCAL_FAILURE_THRESHOLD = 2
+# A restart can leave the previous process's NHK session open on the
+# interface for a few seconds, and the interface allows only one session.
+STARTUP_LOCAL_RETRY_DELAY_SECONDS = 3.0
 LOCAL_RECOVERY_THRESHOLD = 2
 LOCAL_PROBE_INTERVAL_SECONDS = 30.0
 LOCAL_PROBE_MAX_INTERVAL_SECONDS = 300.0
@@ -29,19 +41,28 @@ class NiceConnectionRouter:
         *,
         client_factory: Callable[..., NiceBidiClient] = NiceBidiClient,
         monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._mode = config.connection.mode
         self._health = health
         self._monotonic = monotonic
+        self._sleep = sleep
         self._lock = threading.RLock()
+        self._waiting_commands = 0
+        self._waiting_commands_lock = threading.Lock()
         common = {
             "credentials": config.credentials,
             "device_id": config.device_id,
             "t4_timeout_ms": config.t4_timeout_ms,
+            "should_yield": self._command_waiting,
         }
+        local_kwargs: dict[str, Any] = {}
+        if config.legacy_local_tls:
+            local_kwargs["transport_factory"] = LegacyLanTlsTransport.connect
         self._local = self._make_client(
             client_factory,
             config.connection.local,
+            **local_kwargs,
             **common,
         )
         self._cloud = self._make_client(
@@ -60,6 +81,8 @@ class NiceConnectionRouter:
         self._local_recovery_successes = 0
         self._probe_interval = LOCAL_PROBE_INTERVAL_SECONDS
         self._next_local_probe = 0.0
+        self._legacy_local_tls_enabled = config.legacy_local_tls
+        self._authenticated_once = False
 
     @staticmethod
     def _make_client(
@@ -84,6 +107,26 @@ class NiceConnectionRouter:
             for client in (self._local, self._cloud)
             if client is not None
         )
+
+    @property
+    def legacy_local_tls_enabled(self) -> bool:
+        """Return whether legacy compatibility is enabled for the local route."""
+        return self._legacy_local_tls_enabled
+
+    @property
+    def local_tls_legacy_active(self) -> bool:
+        """Return whether the current local transport uses legacy compatibility."""
+        return bool(
+            self._local
+            and getattr(self._local, "legacy_tls_active", False)
+        )
+
+    @property
+    def local_tls_cipher_security_level(self) -> int | None:
+        """Return the local TLS cipher security level when connected."""
+        if self._local is None:
+            return None
+        return getattr(self._local, "tls_cipher_security_level", None)
 
     @property
     def local_failure_count(self) -> int:
@@ -140,6 +183,26 @@ class NiceConnectionRouter:
             self._local_failures += 1
             self._local_recovery_successes = 0
 
+    def _release_other_session(self, route: NiceConnectionRoute) -> None:
+        """Release the other route before opening the sole allowed NHK session."""
+        other_route = (
+            NiceConnectionRoute.CLOUD
+            if route is NiceConnectionRoute.LOCAL
+            else NiceConnectionRoute.LOCAL
+        )
+        other_state = (
+            self._health.cloud
+            if other_route is NiceConnectionRoute.CLOUD
+            else self._health.local
+        )
+        if other_state is not NiceRouteState.CONNECTED:
+            return
+        self._client(other_route).close()
+        self._health.set_route_state(
+            other_route,
+            NiceRouteState.DISCONNECTED,
+        )
+
     def _call(
         self,
         route: NiceConnectionRoute,
@@ -148,15 +211,30 @@ class NiceConnectionRouter:
         active: bool = True,
         **kwargs,
     ):
+        self._release_other_session(route)
         try:
             result = getattr(self._client(route), method)(*args, **kwargs)
-        except NiceBidiAuthError:
+        except NiceBidiAuthError as err:
+            self._client(route).close()
             self._mark_failure(route)
+            # Coded authentication errors currently originate only from CONNECT.
+            # The router only serves stored entries, whose credentials were
+            # already validated by the config or reauth flow, so these session
+            # rejections stay retryable across reloads and restarts. Credential
+            # rejections such as Code 1 still trigger reauthentication.
+            if nice_error_code(err) in RUNTIME_RETRYABLE_CONNECT_ERROR_CODES:
+                raise NiceBidiConnectionError(str(err)) from err
             raise
-        except (NiceBidiConnectionError, OSError):
+        except (NiceBidiConnectionError, OSError) as err:
+            if is_unsupported_request_error(err):
+                # The route works; only this request is unsupported.
+                self._mark_success(route, active=active)
+                self._authenticated_once = True
+                raise
             self._mark_failure(route)
             raise
         self._mark_success(route, active=active)
+        self._authenticated_once = True
         return result
 
     def _read(self, method: str, *args, **kwargs):
@@ -173,9 +251,33 @@ class NiceConnectionRouter:
                     )
                 except NiceBidiAuthError:
                     raise
-                except (NiceBidiConnectionError, OSError):
-                    if self._local_failures < LOCAL_FAILURE_THRESHOLD:
+                except (NiceBidiConnectionError, OSError) as local_err:
+                    if is_unsupported_request_error(local_err):
                         raise
+                    # Setup creates a fresh router for every retry. Waiting for
+                    # a second failure here would prevent the initial cloud
+                    # fallback from ever being reached.
+                    if (
+                        self._authenticated_once
+                        and self._local_failures < LOCAL_FAILURE_THRESHOLD
+                    ):
+                        raise
+                    failure: Exception = local_err
+                    if not self._authenticated_once:
+                        self._sleep(STARTUP_LOCAL_RETRY_DELAY_SECONDS)
+                        try:
+                            return self._call(
+                                NiceConnectionRoute.LOCAL, method, *args, **kwargs
+                            )
+                        except NiceBidiAuthError:
+                            raise
+                        except (NiceBidiConnectionError, OSError) as retry_err:
+                            failure = retry_err
+                    _LOGGER.warning(
+                        "Nice local connection failed (%s); using the cloud relay "
+                        "until the local route recovers",
+                        failure,
+                    )
                     self._selected = NiceConnectionRoute.CLOUD
                     self._next_local_probe = (
                         self._monotonic() + self._probe_interval
@@ -196,7 +298,9 @@ class NiceConnectionRouter:
                     )
                 except NiceBidiAuthError:
                     raise
-                except (NiceBidiConnectionError, OSError):
+                except (NiceBidiConnectionError, OSError) as probe_err:
+                    if is_unsupported_request_error(probe_err):
+                        raise
                     self._probe_interval = min(
                         self._probe_interval * 2,
                         LOCAL_PROBE_MAX_INTERVAL_SECONDS,
@@ -218,9 +322,24 @@ class NiceConnectionRouter:
                         return local_result
             return self._call(NiceConnectionRoute.CLOUD, method, *args, **kwargs)
 
+    def _command_waiting(self) -> bool:
+        """Return whether a command is queued behind the current operation."""
+        return self._waiting_commands > 0
+
+    def _acquire_for_command(self) -> None:
+        """Take the session lock, asking preemptible reads to yield meanwhile."""
+        with self._waiting_commands_lock:
+            self._waiting_commands += 1
+        try:
+            self._lock.acquire()
+        finally:
+            with self._waiting_commands_lock:
+                self._waiting_commands -= 1
+
     def _write(self, method: str, *args, **kwargs) -> None:
         """Execute a command once; an ambiguous failure is never replayed."""
-        with self._lock:
+        self._acquire_for_command()
+        try:
             route = self._selected
             try:
                 self._call(route, method, *args, **kwargs)
@@ -235,12 +354,23 @@ class NiceConnectionRouter:
                         self._monotonic() + self._probe_interval
                     )
                 raise
+        finally:
+            self._lock.release()
 
-    def read_status(self, *, include_extended: bool = False):
-        return self._read("read_status", include_extended=include_extended)
+    def read_status(
+        self,
+        *,
+        include_extended: bool = False,
+        preemptible: bool = False,
+    ):
+        return self._read(
+            "read_status",
+            include_extended=include_extended,
+            preemptible=preemptible,
+        )
 
-    def read_nhk_status(self):
-        return self._read("read_nhk_status")
+    def read_nhk_status(self, *, preemptible: bool = False):
+        return self._read("read_nhk_status", preemptible=preemptible)
 
     def read_info(self):
         return self._read("read_info")
@@ -250,6 +380,9 @@ class NiceConnectionRouter:
 
     def read_logs(self, event_count: int = LOG_EVENTS_PER_SCOPE):
         return self._read("read_logs", event_count)
+
+    def read_t4_logs(self, max_rows: int = MAX_T4_LOG_ROWS, *, preemptible: bool = False):
+        return self._read("read_t4_logs", max_rows, preemptible=preemptible)
 
     def read_groups(self):
         return self._read("read_groups")

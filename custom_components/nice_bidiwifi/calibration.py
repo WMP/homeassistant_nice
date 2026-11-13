@@ -604,7 +604,7 @@ class NiceBidiCalibrationController(OwnerBoundController["NiceBidiDataUpdateCoor
         updated_at = datetime.now(UTC)
 
         return {
-            "version": 6,
+            "version": 7,
             "mode": "time",
             "created_at": started_at.isoformat(),
             "updated_at": updated_at.isoformat(),
@@ -2109,12 +2109,12 @@ class NiceBidiCalibrationController(OwnerBoundController["NiceBidiDataUpdateCoor
         try:
             status = await self.hass.async_add_executor_job(self._read_motion_status)
         except NiceBidiAuthError as err:
-            self.client.close()
+            await self.hass.async_add_executor_job(self.client.close)
             self.connection_state = CONNECTION_STATE_AUTH_FAILED
             self.last_error = str(err)
             raise
         except (NiceBidiConnectionError, OSError) as err:
-            self.client.close()
+            await self.hass.async_add_executor_job(self.client.close)
             self.connection_state = CONNECTION_STATE_FAILED
             self.last_error = str(err)
             self.update_interval = ERROR_UPDATE_INTERVAL
@@ -2194,6 +2194,9 @@ class NiceBidiCalibrationController(OwnerBoundController["NiceBidiDataUpdateCoor
 
     def _position_simulation_speed(self, action: str) -> float:
         """Return display animation speed in percent per second."""
+        observed_speed = self._observed_position_speed_percent_per_second.get(action)
+        if observed_speed is not None:
+            return observed_speed
         calibrated_speed = self._calibrated_travel_speed_percent_per_second(action)
         if calibrated_speed is None:
             return POSITION_SIMULATION_FALLBACK_PERCENT_PER_SECOND

@@ -5,6 +5,14 @@ from __future__ import annotations
 import re
 
 
+DMP_STATUS_NHK_FALLBACK_ERROR_CODES = frozenset({"5", "14"})
+DMP_STATUS_COMMAND_ONLY_ERROR_CODES = frozenset({"14"})
+RUNTIME_RETRYABLE_CONNECT_ERROR_CODES = frozenset({"7", "15"})
+# The interface answered a signed request on a working session but does not
+# support it, e.g. DMP status reads on CU_WIFI or an unadvertised DEP action.
+UNSUPPORTED_REQUEST_ERROR_CODES = frozenset({"5", "14"})
+
+
 class NiceBidiError(Exception):
     """Base error for Nice operations."""
 
@@ -23,6 +31,10 @@ class NiceBidiConnectionError(NiceTransportError):
 
 class NiceProtocolError(NiceBidiConnectionError):
     """A protocol response was malformed or unsupported."""
+
+
+class NiceReadPreemptedError(NiceBidiError):
+    """A background read released the session for a pending command."""
 
 
 class NiceUnsupportedError(NiceBidiError):
@@ -65,6 +77,14 @@ def nice_error_code(err: Exception | str) -> str | None:
     """Return a Nice XML error code from an exception or response string."""
     match = re.search(r"<Code>\s*([^<\s]+)\s*</Code>", str(err))
     return match.group(1) if match else None
+
+
+def is_unsupported_request_error(err: Exception) -> bool:
+    """Return whether a working session rejected only the request itself."""
+    return (
+        isinstance(err, NiceBidiConnectionError)
+        and nice_error_code(err) in UNSUPPORTED_REQUEST_ERROR_CODES
+    )
 
 
 # Concise domain names for new layers; legacy names remain the concrete class

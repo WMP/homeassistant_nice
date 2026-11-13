@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from collections import deque
 from typing import Any
 
@@ -12,12 +14,17 @@ from custom_components.nice_bidiwifi.connection import (
     NiceConnectionRoute,
     NiceRouteState,
 )
-from custom_components.nice_bidiwifi.connection_router import NiceConnectionRouter
+from custom_components.nice_bidiwifi.connection_router import (
+    STARTUP_LOCAL_RETRY_DELAY_SECONDS,
+    NiceConnectionRouter,
+)
 from custom_components.nice_bidiwifi.errors import (
     NiceBidiAuthError,
     NiceBidiConnectionError,
+    NiceReadPreemptedError,
 )
 from custom_components.nice_bidiwifi.models.config import NiceEntryConfig
+from custom_components.nice_bidiwifi.transport.lan import LegacyLanTlsTransport
 from custom_components.nice_bidiwifi.transport.relay import RelayTlsTransport
 from tests.conftest import config_entry_data
 
@@ -34,10 +41,11 @@ class RouteClient:
         self.callbacks: list = []
         self.failure_callbacks: list = []
         self.reconnect_count = 0
+        self.close_count = 0
         self.event_stream_active = False
         self.event_stream_error = None
 
-    def read_status(self, *, include_extended: bool = False):
+    def read_status(self, *, include_extended: bool = False, preemptible: bool = False):
         result = self.read_results.popleft()
         if isinstance(result, Exception):
             raise result
@@ -51,6 +59,9 @@ class RouteClient:
                 raise result
 
     def read_logs(self, event_count: int = 32):
+        return self.read_status()
+
+    def read_t4_logs(self, max_rows: int = 100, *, preemptible: bool = False):
         return self.read_status()
 
     def read_groups(self):
@@ -74,14 +85,21 @@ class RouteClient:
         return lambda: self.failure_callbacks.remove(callback)
 
     def close(self) -> None:
-        return None
+        self.close_count += 1
 
 
-def _router(mode: str, *, clock=None):
+def _router(
+    mode: str,
+    *,
+    clock=None,
+    legacy_local_tls: bool = False,
+    sleeps: list[float] | None = None,
+):
     data = config_entry_data(
         connection_mode=mode,
         relay_host="relay.example",
         relay_port=7890,
+        legacy_local_tls=legacy_local_tls,
     )
     config = NiceEntryConfig.from_mapping(data)
     health = NiceConnectionHealth.from_policy(config.connection)
@@ -97,6 +115,7 @@ def _router(mode: str, *, clock=None):
         health,
         client_factory=factory,
         monotonic=clock or (lambda: 0.0),
+        sleep=(sleeps.append if sleeps is not None else lambda _seconds: None),
     )
     return router, health, clients
 
@@ -128,14 +147,33 @@ def test_router_only_constructs_policy_routes(mode: str, routes: list[str]) -> N
     router.close()
 
 
+def test_legacy_tls_factory_is_used_only_for_the_local_route() -> None:
+    """The opt-in compatibility transport never changes the cloud route."""
+    router, _, clients = _router(
+        "local_with_cloud_fallback",
+        legacy_local_tls=True,
+    )
+    local, cloud = clients
+
+    assert local.kwargs["transport_factory"] == LegacyLanTlsTransport.connect
+    assert cloud.kwargs["transport_factory"] == RelayTlsTransport.connect
+    assert router.legacy_local_tls_enabled is True
+    router.close()
+
+
 def test_fallback_switches_after_bounded_local_failures() -> None:
     router, health, clients = _router("local_with_cloud_fallback")
     local, cloud = clients
     local.read_results.extend(
-        [NiceBidiConnectionError("down"), NiceBidiConnectionError("down")]
+        [
+            "initial-local-status",
+            NiceBidiConnectionError("down"),
+            NiceBidiConnectionError("down"),
+        ]
     )
     cloud.read_results.append("cloud-status")
 
+    assert router.read_status() == "initial-local-status"
     with pytest.raises(NiceBidiConnectionError):
         router.read_status()
     assert router.read_status() == "cloud-status"
@@ -143,6 +181,83 @@ def test_fallback_switches_after_bounded_local_failures() -> None:
     assert health.active is NiceConnectionRoute.CLOUD
     assert health.local is NiceRouteState.DISCONNECTED
     assert health.cloud is NiceRouteState.CONNECTED
+
+
+def test_first_local_connection_failure_uses_cloud_fallback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sleeps: list[float] = []
+    router, health, clients = _router("local_with_cloud_fallback", sleeps=sleeps)
+    local, cloud = clients
+    local.read_results.extend(
+        [
+            NiceBidiConnectionError("connection reset by peer"),
+            NiceBidiConnectionError("connection reset by peer"),
+        ]
+    )
+    cloud.read_results.append("cloud-status")
+
+    assert router.read_status() == "cloud-status"
+    assert sleeps == [STARTUP_LOCAL_RETRY_DELAY_SECONDS]
+    assert "using the cloud relay" in caplog.text
+    assert router.selected_route == "cloud"
+    assert health.local is NiceRouteState.DISCONNECTED
+    assert health.cloud is NiceRouteState.CONNECTED
+    assert health.active is NiceConnectionRoute.CLOUD
+
+
+@pytest.mark.parametrize("error_code", ["5", "14"])
+def test_unsupported_request_is_not_a_local_route_failure(error_code: str) -> None:
+    """CU_WIFI answers DMP status reads with Code 14 on a working session."""
+    sleeps: list[float] = []
+    router, health, clients = _router("local_with_cloud_fallback", sleeps=sleeps)
+    local, cloud = clients
+    local.read_results.append(
+        NiceBidiConnectionError(
+            f"<Error><Code>{error_code}</Code></Error> (type=T4_REQUEST)"
+        )
+    )
+    cloud.read_results.append("must-not-run")
+
+    with pytest.raises(NiceBidiConnectionError, match=f"<Code>{error_code}</Code>"):
+        router.read_status()
+
+    assert sleeps == []
+    assert len(cloud.read_results) == 1
+    assert router.selected_route == "local"
+    assert router.local_failure_count == 0
+    assert health.local is NiceRouteState.CONNECTED
+    assert health.active is NiceConnectionRoute.LOCAL
+
+
+def test_startup_retries_local_before_cloud_fallback() -> None:
+    """A restart can briefly leave the previous session open on the interface."""
+    sleeps: list[float] = []
+    router, health, clients = _router("local_with_cloud_fallback", sleeps=sleeps)
+    local, cloud = clients
+    local.read_results.extend(
+        [NiceBidiConnectionError("connection reset by peer"), "local-status"]
+    )
+    cloud.read_results.append("must-not-run")
+
+    assert router.read_status() == "local-status"
+    assert sleeps == [STARTUP_LOCAL_RETRY_DELAY_SECONDS]
+    assert router.selected_route == "local"
+    assert health.active is NiceConnectionRoute.LOCAL
+    assert len(cloud.read_results) == 1
+
+
+def test_runtime_local_failure_does_not_wait_for_a_retry() -> None:
+    sleeps: list[float] = []
+    router, _, clients = _router("local_with_cloud_fallback", sleeps=sleeps)
+    local, _ = clients
+    local.read_results.extend(["initial-status", NiceBidiConnectionError("down")])
+
+    assert router.read_status() == "initial-status"
+    with pytest.raises(NiceBidiConnectionError):
+        router.read_status()
+
+    assert sleeps == []
 
 
 def test_fallback_requires_stable_local_recovery() -> None:
@@ -154,6 +269,7 @@ def test_fallback_requires_stable_local_recovery() -> None:
     local, cloud = clients
     local.read_results.extend(
         [
+            "initial-local-status",
             NiceBidiConnectionError("down"),
             NiceBidiConnectionError("down"),
             "local-probe-1",
@@ -162,6 +278,7 @@ def test_fallback_requires_stable_local_recovery() -> None:
     )
     cloud.read_results.extend(["cloud-1", "cloud-2"])
 
+    assert router.read_status() == "initial-local-status"
     with pytest.raises(NiceBidiConnectionError):
         router.read_status()
     assert router.read_status() == "cloud-1"
@@ -174,6 +291,39 @@ def test_fallback_requires_stable_local_recovery() -> None:
     assert health.active is NiceConnectionRoute.LOCAL
 
 
+def test_recovery_probe_releases_the_other_nhk_session() -> None:
+    now = [0.0]
+    router, health, clients = _router(
+        "local_with_cloud_fallback",
+        clock=lambda: now[0],
+    )
+    local, cloud = clients
+    local.read_results.extend(
+        [
+            "initial-local-status",
+            NiceBidiConnectionError("down"),
+            NiceBidiConnectionError("down"),
+            "local-probe-1",
+        ]
+    )
+    cloud.read_results.extend(["cloud-1", "cloud-2"])
+
+    assert router.read_status() == "initial-local-status"
+    with pytest.raises(NiceBidiConnectionError):
+        router.read_status()
+    assert router.read_status() == "cloud-1"
+    assert cloud.close_count == 0
+
+    now[0] = 30.0
+    assert router.read_status() == "cloud-2"
+
+    assert cloud.close_count == 1
+    assert local.close_count == 1
+    assert health.active is NiceConnectionRoute.CLOUD
+    assert health.local is NiceRouteState.DISCONNECTED
+    assert health.cloud is NiceRouteState.CONNECTED
+
+
 def test_auth_failure_does_not_try_another_route() -> None:
     router, health, clients = _router("local_with_cloud_fallback")
     local, cloud = clients
@@ -184,6 +334,174 @@ def test_auth_failure_does_not_try_another_route() -> None:
         router.read_status()
     assert len(cloud.read_results) == 1
     assert health.active is NiceConnectionRoute.NONE
+
+
+@pytest.mark.parametrize("error_code", ["7", "15"])
+def test_runtime_connect_error_is_retryable_after_success(
+    error_code: str,
+) -> None:
+    router, health, clients = _router("local_only")
+    local = clients[0]
+    local.read_results.extend(
+        [
+            "initial-status",
+            NiceBidiAuthError(
+                f"<Error><Code>{error_code}</Code></Error> (type=CONNECT)"
+            ),
+        ]
+    )
+
+    assert router.read_status() == "initial-status"
+    with pytest.raises(NiceBidiConnectionError) as caught:
+        router.read_status()
+
+    assert f"<Code>{error_code}</Code>" in str(caught.value)
+    assert health.active is NiceConnectionRoute.NONE
+    assert health.local is NiceRouteState.DISCONNECTED
+
+
+@pytest.mark.parametrize("error_code", ["7", "15"])
+def test_connect_error_is_retryable_on_fresh_router(
+    error_code: str,
+) -> None:
+    """A reload or restart must not turn a session rejection into reauth."""
+    router, health, clients = _router("local_only")
+    local = clients[0]
+    local.read_results.append(
+        NiceBidiAuthError(
+            f"<Error><Code>{error_code}</Code></Error> (type=CONNECT)"
+        )
+    )
+
+    with pytest.raises(NiceBidiConnectionError) as caught:
+        router.read_status()
+
+    assert isinstance(caught.value.__cause__, NiceBidiAuthError)
+    assert local.close_count == 1
+    assert health.active is NiceConnectionRoute.NONE
+    assert health.local is NiceRouteState.DISCONNECTED
+
+
+def test_fresh_router_falls_back_to_cloud_on_local_session_rejection() -> None:
+    router, health, clients = _router("local_with_cloud_fallback")
+    local, cloud = clients
+    rejection = NiceBidiAuthError("<Error><Code>7</Code></Error> (type=CONNECT)")
+    # A second rejection covers a router that retries the local route.
+    local.read_results.extend([rejection, rejection])
+    cloud.read_results.append("cloud-status")
+
+    assert router.read_status() == "cloud-status"
+    assert router.selected_route == "cloud"
+    assert health.active is NiceConnectionRoute.CLOUD
+
+
+def test_credential_rejection_on_fresh_router_remains_auth_failure() -> None:
+    router, _, clients = _router("local_with_cloud_fallback")
+    local, cloud = clients
+    local.read_results.append(
+        NiceBidiAuthError("<Error><Code>1</Code></Error> (type=CONNECT)")
+    )
+    cloud.read_results.append("must-not-run")
+
+    with pytest.raises(NiceBidiAuthError):
+        router.read_status()
+
+    assert len(cloud.read_results) == 1
+
+
+def test_unobserved_connect_code_remains_auth_failure_after_success() -> None:
+    router, _, clients = _router("local_with_cloud_fallback")
+    local, cloud = clients
+    local.read_results.extend(
+        [
+            "initial-status",
+            NiceBidiAuthError(
+                "<Error><Code>1</Code></Error> (type=CONNECT)"
+            ),
+        ]
+    )
+    cloud.read_results.append("must-not-run")
+
+    assert router.read_status() == "initial-status"
+    with pytest.raises(NiceBidiAuthError):
+        router.read_status()
+
+    assert len(cloud.read_results) == 1
+
+
+def test_first_cloud_connect_error_is_retryable_after_local_success() -> None:
+    router, health, clients = _router("local_with_cloud_fallback")
+    local, cloud = clients
+    local.read_results.extend(
+        [
+            "initial-local-status",
+            NiceBidiConnectionError("down"),
+            NiceBidiConnectionError("down"),
+        ]
+    )
+    cloud.read_results.append(
+        NiceBidiAuthError(
+            "<Error><Code>15</Code></Error> (type=CONNECT)"
+        )
+    )
+
+    assert router.read_status() == "initial-local-status"
+    with pytest.raises(NiceBidiConnectionError):
+        router.read_status()
+    with pytest.raises(NiceBidiConnectionError) as caught:
+        router.read_status()
+
+    assert "<Code>15</Code>" in str(caught.value)
+    assert isinstance(caught.value.__cause__, NiceBidiAuthError)
+    assert router.selected_route == "cloud"
+    assert health.active is NiceConnectionRoute.NONE
+    assert health.local is NiceRouteState.DISCONNECTED
+    assert health.cloud is NiceRouteState.DISCONNECTED
+
+
+def test_retryable_connect_error_releases_local_before_cloud_fallback() -> None:
+    router, health, clients = _router("local_with_cloud_fallback")
+    local, cloud = clients
+    local.read_results.extend(
+        [
+            "initial-local-status",
+            NiceBidiConnectionError("down"),
+            NiceBidiAuthError(
+                "<Error><Code>7</Code></Error> (type=CONNECT)"
+            ),
+        ]
+    )
+    cloud.read_results.append("cloud-status")
+
+    assert router.read_status() == "initial-local-status"
+    with pytest.raises(NiceBidiConnectionError):
+        router.read_status()
+    assert router.read_status() == "cloud-status"
+
+    assert local.close_count == 1
+    assert health.active is NiceConnectionRoute.CLOUD
+    assert health.local is NiceRouteState.DISCONNECTED
+    assert health.cloud is NiceRouteState.CONNECTED
+
+
+def test_retryable_connect_error_never_replays_a_command() -> None:
+    router, _, clients = _router("local_with_cloud_fallback")
+    local, cloud = clients
+    local.read_results.extend(
+        [
+            "initial-status",
+            NiceBidiAuthError(
+                "<Error><Code>7</Code></Error> (type=CONNECT)"
+            ),
+        ]
+    )
+
+    assert router.read_status() == "initial-status"
+    with pytest.raises(NiceBidiConnectionError):
+        router.send_action("open")
+
+    assert local.commands == ["open"]
+    assert cloud.commands == []
 
 
 def test_ambiguous_command_is_never_replayed_on_cloud() -> None:
@@ -216,10 +534,11 @@ def test_cloud_only_uses_relay_without_lan() -> None:
 def test_administration_reads_and_writes_honor_route_policy() -> None:
     router, health, clients = _router("cloud_only")
     cloud = clients[0]
-    cloud.read_results.extend(["logs", "groups"])
+    cloud.read_results.extend(["logs", "history", "groups"])
     clock = object()
 
     assert router.read_logs(8) == "logs"
+    assert router.read_t4_logs(5, preemptible=True) == "history"
     assert router.read_groups() == "groups"
     router.update_interface_name("Gate")
     router.update_interface_clock(clock)
@@ -242,6 +561,7 @@ def test_failed_recovery_probe_backs_off_and_does_not_flap() -> None:
     local, cloud = clients
     local.read_results.extend(
         [
+            "initial-local-status",
             NiceBidiConnectionError("down"),
             NiceBidiConnectionError("down"),
             NiceBidiConnectionError("still down"),
@@ -250,6 +570,7 @@ def test_failed_recovery_probe_backs_off_and_does_not_flap() -> None:
     )
     cloud.read_results.extend(["cloud-1", "cloud-2", "cloud-3"])
 
+    assert router.read_status() == "initial-local-status"
     with pytest.raises(NiceBidiConnectionError):
         router.read_status()
     assert router.read_status() == "cloud-1"
@@ -270,3 +591,44 @@ def test_cloud_failure_is_reported_without_lan_attempt() -> None:
         router.read_status()
     assert health.cloud is NiceRouteState.DISCONNECTED
     assert health.local is NiceRouteState.NOT_CONFIGURED
+
+
+def test_command_blocked_behind_a_read_asks_it_to_yield() -> None:
+    router, _, clients = _router("local_only")
+    local = clients[0]
+    should_yield = local.kwargs["should_yield"]
+    assert should_yield() is False
+
+    router._lock.acquire()
+    command = threading.Thread(target=router.send_action, args=("open",))
+    command.start()
+    try:
+        deadline = time.monotonic() + 2.0
+        while not should_yield() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert should_yield() is True
+        assert local.commands == []
+    finally:
+        router._lock.release()
+    command.join(timeout=2.0)
+
+    assert local.commands == ["open"]
+    assert should_yield() is False
+
+
+def test_preempted_read_is_not_a_route_failure() -> None:
+    router, health, clients = _router("local_with_cloud_fallback")
+    local, cloud = clients
+    local.read_results.extend(
+        ["initial-status", NiceReadPreemptedError("yielded")]
+    )
+    cloud.read_results.append("must-not-run")
+
+    assert router.read_status() == "initial-status"
+    with pytest.raises(NiceReadPreemptedError):
+        router.read_status(preemptible=True)
+
+    assert router.local_failure_count == 0
+    assert router.selected_route == "local"
+    assert len(cloud.read_results) == 1
+    assert health.local is NiceRouteState.CONNECTED
