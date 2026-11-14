@@ -15,6 +15,18 @@ from .dmp import (
 from .maneuvers import decode_last_maneuvers
 
 
+# Below this raw value the field is not a real temperature (e.g. FF xx filler).
+MIN_RAW_TEMPERATURE = -50
+
+
+def _motor_temperature(data: bytes | None) -> int | None:
+    """04/D2 offset 14: signed 16-bit (MyNice Pro reads it with ldrsh), so frost stays visible."""
+    if not data or len(data) < 16:
+        return None
+    raw = int.from_bytes(data[14:16], "big", signed=True)
+    return raw - 9 if raw >= MIN_RAW_TEMPERATURE else None
+
+
 def status_from_dmp_registers(
     registers: dict[str, DmpResponse],
 ) -> NiceStatus:
@@ -83,13 +95,7 @@ def status_from_dmp_registers(
         diagnostics_io_byte=io_byte,
         bluebus_devices=decode_bluebus_devices(dmp_bytes(registers.get("04/D0"))),
         last_maneuvers=decode_last_maneuvers(dmp_bytes(registers.get("04/DA"))),
-        motor_temperature=(
-            int.from_bytes(diagnostic_parameters[14:16], "big") - 9
-            if diagnostic_parameters
-            and len(diagnostic_parameters) > 15
-            and diagnostic_parameters[14] < 0x80  # vendor "not available"
-            else None
-        ),
+        motor_temperature=_motor_temperature(diagnostic_parameters),
         service_voltage=(
             int.from_bytes(diagnostic_parameters[8:10], "big")
             if diagnostic_parameters
