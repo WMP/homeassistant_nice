@@ -35,7 +35,10 @@ from custom_components.nice_bidiwifi.client import (
     parse_info_xml,
 )
 from custom_components.nice_bidiwifi.protocol.t4.dmp import DmpResponse
-from custom_components.nice_bidiwifi.protocol.t4.status import status_from_dmp_registers
+from custom_components.nice_bidiwifi.protocol.t4.status import (
+    CONTROLLER_ERROR_BITS,
+    status_from_dmp_registers,
+)
 from tests.conftest import make_device_info, make_status
 
 
@@ -1443,6 +1446,24 @@ def test_reconnect_count_does_not_wait_for_the_session_lock() -> None:
         release.set()
         holder.join(timeout=2.0)
         reader.join(timeout=2.0)
+
+
+NO_ERRORS = dict.fromkeys(CONTROLLER_ERROR_BITS, False)
+
+
+@pytest.mark.parametrize(
+    ("d1", "errors"),
+    [
+        ("0100400008040000000000020100", NO_ERRORS),
+        ("0100400008040000000003020100", {**NO_ERRORS, "positions": True, "bluebus": True}),
+        ("01004000", None),
+    ],
+)
+def test_status_from_dmp_registers_decodes_controller_errors(d1, errors) -> None:
+    """Test 04/D1 byte 10 error bits (first row: our controller, no errors)."""
+    status = status_from_dmp_registers(_dmp_registers(rD1=bytes.fromhex(d1)))
+
+    assert status.controller_errors == errors
 
 
 def test_status_from_dmp_registers_decodes_bluebus_devices() -> None:

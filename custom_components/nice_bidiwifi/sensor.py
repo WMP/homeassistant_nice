@@ -70,6 +70,13 @@ def _bluebus_fault_count(coordinator: NiceBidiDataUpdateCoordinator) -> int | No
     return sum(value in _BLUEBUS_FAULT_NAMES for value in status.bluebus_devices.values())
 
 
+def _controller_error_count(coordinator: NiceBidiDataUpdateCoordinator) -> int | None:
+    status = _status(coordinator)
+    if status is None or status.controller_errors is None:
+        return None
+    return sum(status.controller_errors.values())
+
+
 def _last_maneuvers(coordinator: NiceBidiDataUpdateCoordinator) -> tuple[str, ...] | None:
     status = _status(coordinator)
     return status.last_maneuvers if status else None
@@ -487,6 +494,18 @@ SENSORS: tuple[NiceBidiSensorEntityDescription, ...] = (
         value_fn=_bluebus_fault_count,
         extra_attributes_fn=lambda coordinator: (
             dict(_status(coordinator).bluebus_devices or {})
+            if _status(coordinator)
+            else {}
+        ),
+    ),
+    NiceBidiSensorEntityDescription(
+        key="controller_errors",
+        name="Controller errors",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:alert-circle-outline",
+        value_fn=_controller_error_count,
+        extra_attributes_fn=lambda coordinator: (
+            dict(_status(coordinator).controller_errors or {})
             if _status(coordinator)
             else {}
         ),

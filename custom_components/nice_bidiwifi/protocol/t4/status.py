@@ -15,6 +15,28 @@ from .dmp import (
 from .maneuvers import decode_last_maneuvers
 
 
+# 04/D1 byte 10, bits 0-6 = MyNice Pro T4InputOutputDiagnostic ids 37-43 (1 = ERR, "Err positions" @0x114b0).
+CONTROLLER_ERROR_BITS = (
+    "positions",
+    "bluebus",
+    "alt",
+    "functions",
+    "regulations",
+    "map_1",
+    "map_2",
+)
+
+
+def decode_controller_errors(data: bytes | None) -> dict[str, bool] | None:
+    """Return the controller error flags of 04/D1, or None when not read."""
+    if not data or len(data) < 11 or all(byte == 0xFF for byte in data):
+        return None
+    return {
+        name: bool(data[10] >> bit & 1)
+        for bit, name in enumerate(CONTROLLER_ERROR_BITS)
+    }
+
+
 # Below this raw value the field is not a real temperature (e.g. FF xx filler).
 MIN_RAW_TEMPERATURE = -50
 
@@ -94,6 +116,7 @@ def status_from_dmp_registers(
         limit_closed=bool(io_byte & 0x02) if io_byte is not None else None,
         diagnostics_io_byte=io_byte,
         bluebus_devices=decode_bluebus_devices(dmp_bytes(registers.get("04/D0"))),
+        controller_errors=decode_controller_errors(diagnostics_io),
         last_maneuvers=decode_last_maneuvers(dmp_bytes(registers.get("04/DA"))),
         motor_temperature=_motor_temperature(diagnostic_parameters),
         service_voltage=(

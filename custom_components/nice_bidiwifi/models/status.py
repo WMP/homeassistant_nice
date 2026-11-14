@@ -55,6 +55,7 @@ class NiceStatus:
     obstacle: bool | None = None
     diagnostics_io_byte: int | None = None
     bluebus_devices: dict[str, str] | None = None
+    controller_errors: dict[str, bool] | None = None
     last_maneuvers: tuple[str, ...] | None = None
     # LOCAL-DIAGNOSTIC(pr55): stale maneuver-log flag; see coordinator.py:_cache_extended_status.
     last_maneuvers_stale: bool | None = None
