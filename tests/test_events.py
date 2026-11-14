@@ -1041,3 +1041,28 @@ async def test_nhk_and_04_02_report_one_stop_once(hass, monkeypatch) -> None:
     await hass.async_block_till_done()
     assert [e.data["reason"] for e in events] == ["unexpected_stop"]
     await coordinator.async_shutdown()
+
+
+async def test_photocell_reversal_during_close_is_not_abnormal(hass, monkeypatch) -> None:
+    """2026-11-14 cycle 6: the photocell beam was blocked while the gate closed.
+
+    The controller reversed with opening_from_command and cause none (not photo_*),
+    and NHK reported opening with obstruction false. A reversal is not a stop.
+    """
+    clock = _Clock(monkeypatch)
+    events = async_capture_events(hass, "nice_bidiwifi_abnormal_stop")
+    coordinator = await _abnormal_coordinator(
+        hass, state="closing", current_position=1287, closed_position=0, open_position=5251
+    )
+    controller = coordinator.event_controller
+    coordinator.last_command = "close"
+    coordinator.last_command_monotonic = clock.now - 20.7
+    controller._handle_raw_frame(_t4_event("04 02 83 00 00 00"))
+    clock.now += 0.19
+    controller._handle_raw_frame(frame_xml(_nhk_change("opening")))
+    clock.now += 23.0
+    controller._handle_raw_frame(_t4_event("04 02 04 00 00 00", xml=_nhk_xml("open")))
+    await hass.async_block_till_done()
+    assert events == []
+    assert coordinator.data.state == "open"
+    await coordinator.async_shutdown()

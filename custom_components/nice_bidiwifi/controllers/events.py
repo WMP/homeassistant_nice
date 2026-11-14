@@ -194,7 +194,9 @@ class NiceEventController(OwnerBoundController):
             and change_state.startswith("stopped")
             and change_state not in NORMAL_STOPS
             and (
-                # a stop caused by a remote, key, input or HA command is explained
+                # a stop caused by a remote, key, input or HA command is explained;
+                # on ROBUSR10 a photocell reversal also reports cause none, so
+                # a photocell set to "stop" would fire here
                 event.t4_cause in {None, "none", "undefined"}
                 or self._open_close_read_as_stop(change_state, event.t4_cause)
             )
