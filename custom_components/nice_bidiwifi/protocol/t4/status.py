@@ -13,6 +13,13 @@ from .dmp import (
     status_from_register,
 )
 from .maneuvers import decode_last_maneuvers
+from .options import (
+    MAINTENANCE_MODES,
+    OUTPUT_FUNCTIONS,
+    STANDBY_MODES,
+    STEP_STEP_MODES,
+    option_name,
+)
 
 
 # 04/D1 byte 10, bits 0-6 = MyNice Pro T4InputOutputDiagnostic ids 37-43 (1 = ERR, "Err positions" @0x114b0).
@@ -117,6 +124,21 @@ def status_from_dmp_registers(
         diagnostics_io_byte=io_byte,
         bluebus_devices=decode_bluebus_devices(dmp_bytes(registers.get("04/D0"))),
         controller_errors=decode_controller_errors(diagnostics_io),
+        opening_slowdown_position=dmp_uint(registers.get("04/24")),
+        closing_slowdown_position=dmp_uint(registers.get("04/25")),
+        opening_slowdown_speed=dmp_uint(registers.get("04/45")),
+        closing_slowdown_speed=dmp_uint(registers.get("04/46")),
+        output_1_function=option_name(OUTPUT_FUNCTIONS, dmp_uint(registers.get("04/51"))),
+        output_2_function=option_name(OUTPUT_FUNCTIONS, dmp_uint(registers.get("04/52"))),
+        courtesy_light_time=dmp_uint(registers.get("04/5B")),
+        step_step_mode=option_name(STEP_STEP_MODES, dmp_uint(registers.get("04/61"))),
+        standby_time=dmp_uint(registers.get("04/8D")),
+        standby_mode=option_name(STANDBY_MODES, dmp_uint(registers.get("04/8E"))),
+        pre_flash_open_time=dmp_uint(registers.get("04/95")),
+        pre_flash_close_time=dmp_uint(registers.get("04/99")),
+        automation_blocked=dmp_bool(registers.get("04/9A")),
+        slowdown=dmp_bool(registers.get("04/A2")),
+        maintenance_mode=option_name(MAINTENANCE_MODES, dmp_uint(registers.get("04/B0"))),
         last_maneuvers=decode_last_maneuvers(dmp_bytes(registers.get("04/DA"))),
         motor_temperature=_motor_temperature(diagnostic_parameters),
         service_voltage=(

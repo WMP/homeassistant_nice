@@ -1466,6 +1466,49 @@ def test_status_from_dmp_registers_decodes_controller_errors(d1, errors) -> None
     assert status.controller_errors == errors
 
 
+def test_status_from_dmp_registers_decodes_settings_probed_on_robusr10() -> None:
+    """Test the extra setting registers with the values read from a ROBUSR10."""
+    status = status_from_dmp_registers(
+        _dmp_registers(
+            r24=b"\x01\xf4",
+            r25=b"\x01\xf4",
+            r45=b"\x14",
+            r46=b"\x14",
+            r51=b"\x05",
+            r52=b"\x01",
+            r5B=b"\x3c",
+            r61=b"\x02",
+            r8D=b"\x3c",
+            r8E=b"\x31",
+            r95=b"\x03",
+            r99=b"\x03",
+            r9A=b"\x00",
+            rA2=b"\x01",
+            rB0=b"\x05",
+        )
+    )
+
+    assert (status.opening_slowdown_position, status.closing_slowdown_position) == (500, 500)
+    assert (status.opening_slowdown_speed, status.closing_slowdown_speed) == (20, 20)
+    assert status.output_1_function == "flashing_light"
+    assert status.output_2_function == "gate_open_indicator"
+    assert status.courtesy_light_time == 60
+    assert status.step_step_mode == "open_stop_close_open"
+    assert (status.standby_time, status.standby_mode) == (60, "safety_devices")
+    assert (status.pre_flash_open_time, status.pre_flash_close_time) == (3, 3)
+    assert status.automation_blocked is False
+    assert status.slowdown is True
+    assert status.maintenance_mode == "automatic"
+
+
+def test_status_from_dmp_registers_names_unknown_option_codes() -> None:
+    """Test an option code missing from the app enums stays visible."""
+    status = status_from_dmp_registers(_dmp_registers(r61=b"\x08"))
+
+    assert status.step_step_mode == "code_8"
+    assert status.output_1_function is None
+
+
 def test_status_from_dmp_registers_decodes_bluebus_devices() -> None:
     """Test 04/D0 is decoded into installed BlueBus devices."""
     sample = bytes.fromhex("11008100000000000000007f000000000000000100c00000000000")

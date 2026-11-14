@@ -99,6 +99,22 @@ BINARY_SENSORS: tuple[NiceBidiBinarySensorEntityDescription, ...] = (
         value_fn=lambda status: status.obstacle,
     ),
     NiceBidiBinarySensorEntityDescription(
+        key="automation_blocked",
+        name="Automation blocked",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+        entity_registry_visible_default=False,
+        value_fn=lambda status: status.automation_blocked,
+    ),
+    NiceBidiBinarySensorEntityDescription(
+        key="slowdown",
+        name="Slowdown enabled",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+        entity_registry_visible_default=False,
+        value_fn=lambda status: status.slowdown,
+    ),
+    NiceBidiBinarySensorEntityDescription(
         key="input_1",
         name="Input 1 enabled",
         entity_category=EntityCategory.DIAGNOSTIC,
