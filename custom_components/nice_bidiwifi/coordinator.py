@@ -144,6 +144,8 @@ def _unknown_status() -> NiceBidiStatus:
 
 
 LIMITS_STORAGE_VERSION = 1
+# normal open positions vary by ~5 % (5024-5271); the fault left 39, 66 and 3018 (-42 %)
+LIMITS_DROP_RATIO = 0.75
 
 
 def controller_limits_store(hass: HomeAssistant, entry_id: str) -> Store:
@@ -336,7 +338,7 @@ class NiceBidiDataUpdateCoordinator(
         baseline = self._last_open_position
         if opened is None:
             return
-        if baseline is not None and opened < 0.5 * baseline:
+        if baseline is not None and opened < LIMITS_DROP_RATIO * baseline:
             if self.controller_limits_changed is None:
                 ir.async_create_issue(
                     self.hass,

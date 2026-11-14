@@ -2436,6 +2436,15 @@ async def test_controller_limit_drop_raises_and_clears_repair_issue(
     assert instance.controller_limits_changed is None
     assert registry.async_get_issue(DOMAIN, issue_id) is None
 
+    # 2026-11-14: 5239 -> 3018 (-42 %) must be flagged; normal drift (-5 %) must not
+    await poll(5024)
+    assert instance.controller_limits_changed is None
+    await poll(3018)
+    assert instance.controller_limits_changed == {
+        "previous_open_position": 5024,
+        "open_position": 3018,
+    }
+
 
 async def test_controller_limit_drop_is_one_abnormal_event_with_a_scan(
     hass: HomeAssistant,

@@ -37,6 +37,19 @@ RECENT_COMMAND_SECONDS = 3.0
 ABNORMAL_SCAN_INTERVAL_SECONDS = 30.0
 IMPLAUSIBLE_TRAVEL_POSITION_DELTA = 1000
 IMPLAUSIBLE_TRAVEL_SPEED = 2000  # position units per second
+ABNORMAL_DEDUPE_SECONDS = 2.0  # NHK and 04/02 often report the same stop
+# EvtChangeState values that report a controller fault, not a normal stop
+FAULT_CHANGE_STATES = frozenset(
+    {
+        "force_limiter_intervent",
+        "fototest_failed",
+        "alt_intervention",
+        "memory_err",
+        "hw_err",
+        "double_cmd_err",
+        "lockedmotor_err",
+    }
+)
 # Partial and pause stops are normal travel ends.
 NORMAL_STOPS = frozenset(
     {
@@ -78,6 +91,7 @@ class NiceEventController(OwnerBoundController):
         # LOCAL-DIAGNOSTIC(pr55): move tracking for abnormal-stop checks; see controllers/events.py:_check_abnormal_stop.
         self._t4_command_move: tuple[float, str, int | None] | None = None
         self._nhk_move: tuple[float, str, int | None] | None = None
+        self._last_abnormal_fire: tuple[float, str] | None = None
         self.last_t4_cause: str | None = None
         self.last_t4_change_state: str | None = None
         self.last_t4_basic_diagnostic: str | None = None
@@ -172,14 +186,28 @@ class NiceEventController(OwnerBoundController):
                 # observational only: the endpoint state is still applied
                 event = replace(event, t4_implausible=True)
                 reason = "implausible_travel"
+        if reason is None and change_state in FAULT_CHANGE_STATES:
+            reason = "controller_fault"
         if (
             reason is None
             and change_state is not None
             and change_state.startswith("stopped")
             and change_state not in NORMAL_STOPS
-            # a stop caused by a remote, key, input or HA command is explained
-            and event.t4_cause in {None, "none", "undefined"}
+            and (
+                # a stop caused by a remote, key, input or HA command is explained
+                event.t4_cause in {None, "none", "undefined"}
+                or self._open_close_read_as_stop(change_state, event.t4_cause)
+            )
         ):
+            reason = "unexpected_stop"
+        if (
+            reason is None
+            and nhk == "stopped"
+            and self._nhk_move is not None
+            and now - self._nhk_move[0] < COMMAND_MOVE_WINDOW_SECONDS
+            and self.last_command != "stop"
+        ):
+            # shortcut: a remote stop in the first 5 s of a move is reported too
             reason = "unexpected_stop"
         if reason is None and nhk in {"open", "closed"} and self._nhk_move is not None:
             started, direction, start = self._nhk_move
@@ -204,6 +232,20 @@ class NiceEventController(OwnerBoundController):
             self._nhk_move = None
         return event
 
+    def _open_close_read_as_stop(self, change_state: str, cause: str | None) -> bool:
+        """Return true when the controller stopped on an open or close command.
+
+        On hardware an HA close sent to an open, idle gate came back as
+        stopped_for_command_arrival with cause oview and no motion.
+        """
+        return (
+            change_state == "stopped_for_command_arrival"
+            and cause == "oview"
+            and self.last_command in {"open", "close"}
+            and self.data is not None
+            and not self.data.is_moving
+        )
+
     # LOCAL-DIAGNOSTIC(pr55): recent-command age for abnormal-stop checks.
     def _command_age(self, now: float) -> float | None:
         """Return seconds since a recent command, or None when none is recent."""
@@ -215,6 +257,10 @@ class NiceEventController(OwnerBoundController):
     # LOCAL-DIAGNOSTIC(pr55): abnormal-stop bus event data.
     def _fire_abnormal_stop(self, event: NiceEvent, reason: str, now: float) -> None:
         """Report an abnormal stop that came with a NiceEvent."""
+        last = self._last_abnormal_fire
+        if last is not None and last[1] == reason and now - last[0] < ABNORMAL_DEDUPE_SECONDS:
+            return
+        self._last_abnormal_fire = (now, reason)
         since_command = (
             now - self.last_command_monotonic
             if self.last_command_monotonic is not None
